@@ -1,6 +1,6 @@
 api_key = "enc2:92fffcbfb475392db1381eb7014688b796761353040d8eca34676b829dcb6ee8f615ef336876e4e8244802a1632f1a7bb34b529671c1047578bf18c2f2359baa729b598fc45267dce17d1c3fa7a579"
 default_provider = "custom:https://api.siliconflow.cn/v1"
-default_model = "deepseek-ai/DeepSeek-V3.2"
+default_model = "Pro/MiniMaxAI/MiniMax-M2.5"
 default_temperature = 0.7
 provider_timeout_secs = 120
 model_routes = []
@@ -397,7 +397,7 @@ task_timeout_secs = 120
 
 [http_request]
 enabled = true
-allowed_domains = ["192.168.5.102"]
+allowed_domains = ["192.168.5.102", "internal.lan"]
 max_response_size = 1000000
 timeout_secs = 30
 allow_private_hosts = true
@@ -417,7 +417,7 @@ summarize_video = true
 enabled = true
 allowed_domains = ["*"]
 blocked_domains = []
-allowed_private_hosts = ["192.168.5.102", "internal.lan"]
+ 
 
 max_response_size = 500000
 timeout_secs = 30
