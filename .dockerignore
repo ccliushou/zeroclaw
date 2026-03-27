@@ -6,6 +6,10 @@
 # Rust build artifacts (can be multiple GB)
 target
 
+# Cross-build distribution artifacts
+dist
+zeroclaw-*.tar.gz
+
 # Documentation and examples (not needed for runtime)
 docs
 examples
