@@ -13,7 +13,7 @@ const STATUS_FLUSH_SECONDS: u64 = 5;
 async fn wait_for_shutdown_signal() -> Result<()> {
     #[cfg(unix)]
     {
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::{SignalKind, signal};
 
         let mut sigint = signal(SignalKind::interrupt())?;
         let mut sigterm = signal(SignalKind::terminate())?;
@@ -54,6 +54,10 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
 
     crate::health::mark_component_ok("daemon");
 
+    // Shared broadcast channel so all daemon components (gateway, cron,
+    // heartbeat) can publish real-time events to dashboard clients.
+    let (event_tx, _rx) = tokio::sync::broadcast::channel::<serde_json::Value>(256);
+
     if config.heartbeat.enabled {
         let _ =
             crate::heartbeat::engine::HeartbeatEngine::ensure_heartbeat_file(&config.workspace_dir)
@@ -65,6 +69,7 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
     {
         let gateway_cfg = config.clone();
         let gateway_host = host.clone();
+        let gateway_event_tx = event_tx.clone();
         handles.push(spawn_component_supervisor(
             "gateway",
             initial_backoff,
@@ -72,7 +77,10 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
             move || {
                 let cfg = gateway_cfg.clone();
                 let host = gateway_host.clone();
-                async move { Box::pin(crate::gateway::run_gateway(&host, port, cfg)).await }
+                let tx = gateway_event_tx.clone();
+                async move {
+                    Box::pin(crate::gateway::run_gateway(&host, port, cfg, Some(tx))).await
+                }
             },
         ));
     }
@@ -95,6 +103,27 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
         }
     }
 
+    // Wire up MQTT SOP listener if configured and enabled
+    if let Some(ref mqtt_config) = config.channels_config.mqtt {
+        if mqtt_config.enabled {
+            let mqtt_cfg = mqtt_config.clone();
+            handles.push(spawn_component_supervisor(
+                "mqtt",
+                initial_backoff,
+                max_backoff,
+                move || {
+                    let cfg = mqtt_cfg.clone();
+                    async move { Box::pin(run_mqtt_sop_listener(&cfg)).await }
+                },
+            ));
+        } else {
+            tracing::info!("MQTT channel configured but disabled (enabled = false)");
+            crate::health::mark_component_ok("mqtt");
+        }
+    } else {
+        crate::health::mark_component_ok("mqtt");
+    }
+
     if config.heartbeat.enabled {
         let heartbeat_cfg = config.clone();
         handles.push(spawn_component_supervisor(
@@ -110,13 +139,15 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
 
     if config.cron.enabled {
         let scheduler_cfg = config.clone();
+        let scheduler_event_tx = event_tx.clone();
         handles.push(spawn_component_supervisor(
             "scheduler",
             initial_backoff,
             max_backoff,
             move || {
                 let cfg = scheduler_cfg.clone();
-                async move { Box::pin(crate::cron::scheduler::run(cfg)).await }
+                let tx = scheduler_event_tx.clone();
+                async move { Box::pin(crate::cron::scheduler::run(cfg, Some(tx))).await }
             },
         ));
     } else {
@@ -216,7 +247,7 @@ where
 
 async fn run_heartbeat_worker(config: Config) -> Result<()> {
     use crate::heartbeat::engine::{
-        compute_adaptive_interval, HeartbeatEngine, HeartbeatTask, TaskPriority, TaskStatus,
+        HeartbeatEngine, HeartbeatTask, TaskPriority, TaskStatus, compute_adaptive_interval,
     };
     use std::sync::Arc;
 
@@ -264,17 +295,25 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                             } else {
                                 continue;
                             };
-                        let _ = crate::cron::scheduler::deliver_announcement(
+                        let delivery_fut = crate::cron::scheduler::deliver_announcement(
                             &dm_config, &channel, &target, &alert,
-                        )
-                        .await;
+                        );
+                        match tokio::time::timeout(Duration::from_secs(30), delivery_fut).await {
+                            Ok(Err(e)) => {
+                                tracing::warn!("Deadman alert delivery failed: {e}");
+                            }
+                            Err(_) => {
+                                tracing::warn!("Deadman alert delivery timed out (30s)");
+                            }
+                            Ok(Ok(())) => {}
+                        }
                     }
                 }
             }
         });
     }
 
-    let base_interval = config.heartbeat.interval_minutes.max(5);
+    let base_interval = config.heartbeat.interval_minutes.max(1);
     let mut sleep_mins = base_interval;
 
     loop {
@@ -319,7 +358,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                 "[Heartbeat Task | decision] {}",
                 HeartbeatEngine::build_decision_prompt(&tasks),
             );
-            match Box::pin(crate::agent::run(
+            let phase1_fut = Box::pin(crate::agent::run(
                 config.clone(),
                 Some(decision_prompt),
                 None,
@@ -329,9 +368,24 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                 false,
                 None,
                 None,
-            ))
-            .await
-            {
+            ));
+            let phase1_result = if config.heartbeat.task_timeout_secs > 0 {
+                match tokio::time::timeout(
+                    Duration::from_secs(config.heartbeat.task_timeout_secs),
+                    phase1_fut,
+                )
+                .await
+                {
+                    Ok(r) => r,
+                    Err(_) => Err(anyhow::anyhow!(
+                        "Phase 1 decision timed out ({}s)",
+                        config.heartbeat.task_timeout_secs
+                    )),
+                }
+            } else {
+                phase1_fut.await
+            };
+            match phase1_result {
                 Ok(response) => {
                     let indices = HeartbeatEngine::parse_decision_response(&response, tasks.len());
                     if indices.is_empty() {
@@ -370,16 +424,57 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
             None
         };
 
+        // Create memory once per tick for recall + consolidation.
+        let heartbeat_memory: Option<Box<dyn crate::memory::Memory>> =
+            crate::memory::create_memory(
+                &config.memory,
+                &config.workspace_dir,
+                config.api_key.as_deref(),
+            )
+            .ok();
+
         let mut tick_had_error = false;
         for task in &tasks_to_run {
             let task_start = std::time::Instant::now();
             let task_prompt = format!("[Heartbeat Task | {}] {}", task.priority, task.text);
-            let prompt = match &session_context {
-                Some(ctx) => format!("{ctx}\n\n{task_prompt}"),
-                None => task_prompt,
+
+            // Recall relevant memories so heartbeat tasks have context awareness.
+            // Exclude `Conversation` memories to prevent chat context from
+            // leaking into scheduled executions (see #5415).
+            let memory_context = if let Some(ref mem) = heartbeat_memory {
+                match mem.recall(&task.text, 5, None, None, None).await {
+                    Ok(entries) if !entries.is_empty() => {
+                        let ctx: String = entries
+                            .iter()
+                            .filter(|e| {
+                                !matches!(
+                                    e.category,
+                                    crate::memory::traits::MemoryCategory::Conversation
+                                )
+                            })
+                            .map(|e| format!("- {}: {}", e.key, e.content))
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        if ctx.is_empty() {
+                            None
+                        } else {
+                            Some(format!("[Memory context]\n{ctx}\n"))
+                        }
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+
+            let prompt = match (&session_context, &memory_context) {
+                (Some(sc), Some(mc)) => format!("{mc}\n{sc}\n\n{task_prompt}"),
+                (Some(sc), None) => format!("{sc}\n\n{task_prompt}"),
+                (None, Some(mc)) => format!("{mc}\n\n{task_prompt}"),
+                (None, None) => task_prompt,
             };
             let temp = config.default_temperature;
-            match Box::pin(crate::agent::run(
+            let phase2_fut = Box::pin(crate::agent::run(
                 config.clone(),
                 Some(prompt),
                 None,
@@ -389,9 +484,24 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                 false,
                 None,
                 None,
-            ))
-            .await
-            {
+            ));
+            let phase2_result = if config.heartbeat.task_timeout_secs > 0 {
+                match tokio::time::timeout(
+                    Duration::from_secs(config.heartbeat.task_timeout_secs),
+                    phase2_fut,
+                )
+                .await
+                {
+                    Ok(r) => r,
+                    Err(_) => Err(anyhow::anyhow!(
+                        "Heartbeat task timed out ({}s)",
+                        config.heartbeat.task_timeout_secs
+                    )),
+                }
+            } else {
+                phase2_fut.await
+            };
+            match phase2_result {
                 Ok(output) => {
                     crate::health::mark_component_ok("heartbeat");
                     #[allow(clippy::cast_possible_truncation)]
@@ -408,25 +518,63 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                         duration_ms,
                         config.heartbeat.max_run_history,
                     );
+                    // Consolidate heartbeat output to memory for cross-session awareness.
+                    if config.memory.auto_save && output.chars().count() >= 50 {
+                        if let Some(ref mem) = heartbeat_memory {
+                            let key = format!("heartbeat_{}", uuid::Uuid::new_v4());
+                            let summary = if output.len() > 500 {
+                                // Find a valid UTF-8 char boundary at or before 500.
+                                let mut end = 500;
+                                while end > 0 && !output.is_char_boundary(end) {
+                                    end -= 1;
+                                }
+                                &output[..end]
+                            } else {
+                                &output
+                            };
+                            let _ = mem
+                                .store(
+                                    &key,
+                                    &format!("Heartbeat task '{}': {}", task.text, summary),
+                                    crate::memory::MemoryCategory::Daily,
+                                    None,
+                                )
+                                .await;
+                        }
+                    }
+
                     let announcement = if output.trim().is_empty() {
                         format!("💓 heartbeat task completed: {}", task.text)
                     } else {
                         output
                     };
                     if let Some((channel, target)) = &delivery {
-                        if let Err(e) = crate::cron::scheduler::deliver_announcement(
-                            &config,
-                            channel,
-                            target,
-                            &announcement,
+                        let delivery_result = tokio::time::timeout(
+                            Duration::from_secs(30),
+                            crate::cron::scheduler::deliver_announcement(
+                                &config,
+                                channel,
+                                target,
+                                &announcement,
+                            ),
                         )
-                        .await
-                        {
-                            crate::health::mark_component_error(
-                                "heartbeat",
-                                format!("delivery failed: {e}"),
-                            );
-                            tracing::warn!("Heartbeat delivery failed: {e}");
+                        .await;
+                        match delivery_result {
+                            Ok(Err(e)) => {
+                                crate::health::mark_component_error(
+                                    "heartbeat",
+                                    format!("delivery failed: {e}"),
+                                );
+                                tracing::warn!("Heartbeat delivery failed: {e}");
+                            }
+                            Err(_) => {
+                                crate::health::mark_component_error(
+                                    "heartbeat",
+                                    "delivery timed out (30s)".to_string(),
+                                );
+                                tracing::warn!("Heartbeat delivery timed out (30s)");
+                            }
+                            Ok(Ok(())) => {}
                         }
                     }
                 }
@@ -759,6 +907,23 @@ fn has_supervised_channels(config: &Config) -> bool {
         .any(|(_, ok)| *ok)
 }
 
+async fn run_mqtt_sop_listener(config: &crate::config::MqttConfig) -> Result<()> {
+    use crate::config::SopConfig;
+    use crate::memory::NoneMemory;
+    use crate::sop::{SopAuditLogger, SopEngine};
+    use std::sync::{Arc, Mutex};
+
+    // Initialize SOP engine
+    let engine = Arc::new(Mutex::new(SopEngine::new(SopConfig::default())));
+
+    // Initialize SOP audit logger with NoneMemory (MQTT listener is headless)
+    let audit = Arc::new(SopAuditLogger::new(Arc::new(NoneMemory)));
+
+    // Validate MQTT config and run the listener
+    config.validate()?;
+    crate::channels::mqtt::run_mqtt_sop_listener(config, engine, audit).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -797,10 +962,12 @@ mod tests {
         let component = &snapshot["components"]["daemon-test-fail"];
         assert_eq!(component["status"], "error");
         assert!(component["restart_count"].as_u64().unwrap_or(0) >= 1);
-        assert!(component["last_error"]
-            .as_str()
-            .unwrap_or("")
-            .contains("boom"));
+        assert!(
+            component["last_error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("boom")
+        );
     }
 
     #[tokio::test]
@@ -815,10 +982,12 @@ mod tests {
         let component = &snapshot["components"]["daemon-test-exit"];
         assert_eq!(component["status"], "error");
         assert!(component["restart_count"].as_u64().unwrap_or(0) >= 1);
-        assert!(component["last_error"]
-            .as_str()
-            .unwrap_or("")
-            .contains("component exited unexpectedly"));
+        assert!(
+            component["last_error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("component exited unexpectedly")
+        );
     }
 
     #[test]
@@ -831,6 +1000,7 @@ mod tests {
     fn detects_supervised_channels_present() {
         let mut config = Config::default();
         config.channels_config.telegram = Some(crate::config::TelegramConfig {
+            enabled: true,
             bot_token: "token".into(),
             allowed_users: vec![],
             stream_mode: crate::config::StreamMode::default(),
@@ -847,6 +1017,7 @@ mod tests {
     fn detects_dingtalk_as_supervised_channel() {
         let mut config = Config::default();
         config.channels_config.dingtalk = Some(crate::config::schema::DingTalkConfig {
+            enabled: true,
             client_id: "client_id".into(),
             client_secret: "client_secret".into(),
             allowed_users: vec!["*".into()],
@@ -859,6 +1030,7 @@ mod tests {
     fn detects_mattermost_as_supervised_channel() {
         let mut config = Config::default();
         config.channels_config.mattermost = Some(crate::config::schema::MattermostConfig {
+            enabled: true,
             url: "https://mattermost.example.com".into(),
             bot_token: "token".into(),
             channel_id: Some("channel-id".into()),
@@ -875,6 +1047,7 @@ mod tests {
     fn detects_qq_as_supervised_channel() {
         let mut config = Config::default();
         config.channels_config.qq = Some(crate::config::schema::QQConfig {
+            enabled: true,
             app_id: "app-id".into(),
             app_secret: "app-secret".into(),
             allowed_users: vec!["*".into()],
@@ -887,11 +1060,13 @@ mod tests {
     fn detects_nextcloud_talk_as_supervised_channel() {
         let mut config = Config::default();
         config.channels_config.nextcloud_talk = Some(crate::config::schema::NextcloudTalkConfig {
+            enabled: true,
             base_url: "https://cloud.example.com".into(),
             app_token: "app-token".into(),
             webhook_secret: None,
             allowed_users: vec!["*".into()],
             proxy_url: None,
+            bot_name: None,
         });
         assert!(has_supervised_channels(&config));
     }
@@ -908,9 +1083,10 @@ mod tests {
         let mut config = Config::default();
         config.heartbeat.target = Some("telegram".into());
         let err = resolve_heartbeat_delivery(&config).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("heartbeat.to is required when heartbeat.target is set"));
+        assert!(
+            err.to_string()
+                .contains("heartbeat.to is required when heartbeat.target is set")
+        );
     }
 
     #[test]
@@ -918,9 +1094,10 @@ mod tests {
         let mut config = Config::default();
         config.heartbeat.to = Some("123456".into());
         let err = resolve_heartbeat_delivery(&config).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("heartbeat.target is required when heartbeat.to is set"));
+        assert!(
+            err.to_string()
+                .contains("heartbeat.target is required when heartbeat.to is set")
+        );
     }
 
     #[test]
@@ -929,9 +1106,10 @@ mod tests {
         config.heartbeat.target = Some("email".into());
         config.heartbeat.to = Some("ops@example.com".into());
         let err = resolve_heartbeat_delivery(&config).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("unsupported heartbeat.target channel"));
+        assert!(
+            err.to_string()
+                .contains("unsupported heartbeat.target channel")
+        );
     }
 
     #[test]
@@ -940,9 +1118,10 @@ mod tests {
         config.heartbeat.target = Some("telegram".into());
         config.heartbeat.to = Some("123456".into());
         let err = resolve_heartbeat_delivery(&config).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("channels_config.telegram is not configured"));
+        assert!(
+            err.to_string()
+                .contains("channels_config.telegram is not configured")
+        );
     }
 
     #[test]
@@ -951,6 +1130,7 @@ mod tests {
         config.heartbeat.target = Some("telegram".into());
         config.heartbeat.to = Some("123456".into());
         config.channels_config.telegram = Some(crate::config::TelegramConfig {
+            enabled: true,
             bot_token: "bot-token".into(),
             allowed_users: vec![],
             stream_mode: crate::config::StreamMode::default(),
@@ -969,6 +1149,7 @@ mod tests {
     fn auto_detect_telegram_when_configured() {
         let mut config = Config::default();
         config.channels_config.telegram = Some(crate::config::TelegramConfig {
+            enabled: true,
             bot_token: "bot-token".into(),
             allowed_users: vec!["user123".into()],
             stream_mode: crate::config::StreamMode::default(),
@@ -999,7 +1180,7 @@ mod tests {
     #[tokio::test]
     async fn sighup_does_not_shut_down_daemon() {
         use libc;
-        use tokio::time::{timeout, Duration};
+        use tokio::time::{Duration, timeout};
 
         let handle = tokio::spawn(wait_for_shutdown_signal());
 

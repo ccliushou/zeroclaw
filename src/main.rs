@@ -33,14 +33,14 @@
     dead_code
 )]
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
-use dialoguer::Password;
+use dialoguer::{Password, Select};
 use serde::{Deserialize, Serialize};
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use tracing::{info, warn};
-use tracing_subscriber::{fmt, EnvFilter};
+use tracing_subscriber::{EnvFilter, fmt};
 
 fn parse_temperature(s: &str) -> std::result::Result<f64, String> {
     let t: f64 = s.parse().map_err(|e| format!("{e}"))?;
@@ -109,6 +109,8 @@ mod skillforge;
 mod skills;
 mod sop;
 mod tools;
+mod trust;
+mod tui;
 mod tunnel;
 mod util;
 mod verifiable_intent;
@@ -194,6 +196,10 @@ enum Commands {
         /// Skip interactive prompts and use quick setup with defaults
         #[arg(long)]
         quick: bool,
+
+        /// Use the ratatui-based TUI onboarding wizard
+        #[arg(long)]
+        tui: bool,
     },
 
     /// Start the AI agent loop
@@ -581,11 +587,74 @@ Examples:
         install: bool,
     },
 
+    /// View or change config properties by dotted path
+    #[command(long_about = "\
+View, set, or initialize config properties.
+
+Properties are addressed by dotted path (e.g. channels.matrix.mention-only).
+Secret fields (API keys, tokens) automatically use masked input.
+Enum fields offer interactive selection when value is omitted.
+
+Examples:
+  zeroclaw props list                                  # list all properties
+  zeroclaw props list --secrets                        # list only secrets
+  zeroclaw props list --filter channels.matrix         # filter by prefix
+  zeroclaw props get channels.matrix.mention-only      # get a value
+  zeroclaw props set channels.matrix.mention-only true # set a value
+  zeroclaw props set channels.matrix.access-token      # secret: masked input
+  zeroclaw props set channels.matrix.stream-mode       # enum: interactive select
+  zeroclaw props init channels.matrix                  # init section with defaults
+
+Property path tab completion is included automatically in `zeroclaw completions <shell>`.")]
+    Props {
+        #[command(subcommand)]
+        props_command: PropsCommands,
+    },
+
     /// Manage WASM plugins
     #[cfg(feature = "plugins-wasm")]
     Plugin {
         #[command(subcommand)]
         plugin_command: PluginCommands,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum PropsCommands {
+    /// List all config properties with current values
+    List {
+        /// Filter by path prefix (e.g. "channels.telegram")
+        #[arg(short, long)]
+        filter: Option<String>,
+        /// Show only secret (encrypted) fields
+        #[arg(long)]
+        secrets: bool,
+    },
+    /// Get a config property value
+    Get {
+        /// Property path (e.g. channels.telegram.mention-only)
+        path: String,
+    },
+    /// Set a config property (secret fields auto-prompt for masked input)
+    Set {
+        /// Property path
+        path: String,
+        /// New value (omit for secret fields to get masked input)
+        value: Option<String>,
+        /// Skip interactive prompts — require value on command line, accept raw strings for enums
+        #[arg(long)]
+        no_interactive: bool,
+    },
+    /// Initialize unconfigured sections with defaults (enabled=false)
+    Init {
+        /// Section prefix (e.g. channels.matrix). Omit to init all.
+        section: Option<String>,
+    },
+    /// Print matching property paths for shell completion (hidden)
+    #[command(hide = true)]
+    Complete {
+        /// Partial path to complete
+        partial: Option<String>,
     },
 }
 
@@ -835,7 +904,8 @@ async fn main() -> Result<()> {
         if config_dir.trim().is_empty() {
             bail!("--config-dir cannot be empty");
         }
-        std::env::set_var("ZEROCLAW_CONFIG_DIR", config_dir);
+        // SAFETY: called early in main before any threads are spawned.
+        unsafe { std::env::set_var("ZEROCLAW_CONFIG_DIR", config_dir) };
     }
 
     // Completions must remain stdout-only and should not load config or initialize logging.
@@ -871,6 +941,7 @@ async fn main() -> Result<()> {
         model,
         memory,
         quick,
+        tui: use_tui,
     } = &cli.command
     {
         let force = *force;
@@ -881,6 +952,7 @@ async fn main() -> Result<()> {
         let model = model.clone();
         let memory = memory.clone();
         let quick = *quick;
+        let use_tui = *use_tui;
 
         if reinit && channels_only {
             bail!("--reinit and --channels-only cannot be used together");
@@ -944,6 +1016,12 @@ async fn main() -> Result<()> {
             api_key.is_some() || provider.is_some() || model.is_some() || memory.is_some();
         let is_tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
         let env_interactive = std::env::var("ZEROCLAW_INTERACTIVE").as_deref() == Ok("1");
+
+        // TUI onboarding mode (ratatui-based)
+        if use_tui {
+            Box::pin(tui::run_tui_onboarding()).await?;
+            return Ok(());
+        }
 
         let config = if channels_only {
             Box::pin(onboard::run_channels_repair_wizard()).await
@@ -1081,7 +1159,7 @@ async fn main() -> Result<()> {
                     }
 
                     log_gateway_start(&host, port);
-                    Box::pin(gateway::run_gateway(&host, port, config)).await
+                    Box::pin(gateway::run_gateway(&host, port, config, None)).await
                 }
                 Some(zeroclaw::GatewayCommands::GetPaircode { new }) => {
                     let port = config.gateway.port;
@@ -1102,8 +1180,12 @@ async fn main() -> Result<()> {
                         }
                         Ok(None) => {
                             if config.gateway.require_pairing {
-                                println!("🔐 Gateway pairing is enabled, but no active pairing code available.");
-                                println!("   The gateway may already be paired, or the code has been used.");
+                                println!(
+                                    "🔐 Gateway pairing is enabled, but no active pairing code available."
+                                );
+                                println!(
+                                    "   The gateway may already be paired, or the code has been used."
+                                );
                                 println!("   Restart the gateway to generate a new pairing code.");
                             } else {
                                 println!("⚠️  Gateway pairing is disabled in config.");
@@ -1130,18 +1212,28 @@ async fn main() -> Result<()> {
                 Some(zeroclaw::GatewayCommands::Start { port, host }) => {
                     let (port, host) = resolve_gateway_addr(&config, port, host);
                     log_gateway_start(&host, port);
-                    Box::pin(gateway::run_gateway(&host, port, config)).await
+                    Box::pin(gateway::run_gateway(&host, port, config, None)).await
                 }
                 None => {
                     let port = config.gateway.port;
                     let host = config.gateway.host.clone();
                     log_gateway_start(&host, port);
-                    Box::pin(gateway::run_gateway(&host, port, config)).await
+                    Box::pin(gateway::run_gateway(&host, port, config, None)).await
                 }
             }
         }
 
         Commands::Daemon { port, host } => {
+            if let Ok(exe) = std::env::current_exe() {
+                let exe_str = exe.to_string_lossy();
+                if exe_str.contains(".cargo/bin") || exe_str.contains("/home/") {
+                    tracing::warn!(
+                        "Daemon running from user home directory: {}. \
+                         Consider installing to /usr/local/bin for system-wide service.",
+                        exe_str
+                    );
+                }
+            }
             let port = port.unwrap_or(config.gateway.port);
             let host = host.unwrap_or_else(|| config.gateway.host.clone());
             if port == 0 {
@@ -1240,9 +1332,37 @@ async fn main() -> Result<()> {
                 config.autonomy.max_actions_per_hour
             );
             println!(
-                "  Max cost/day:      ${:.2}",
-                f64::from(config.autonomy.max_cost_per_day_cents) / 100.0
+                "  Cost tracking:     {}",
+                if config.cost.enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
             );
+            println!("  Max cost/day:      ${:.2}", config.cost.daily_limit_usd);
+            println!("  Max cost/month:    ${:.2}", config.cost.monthly_limit_usd);
+            if config.cost.enabled {
+                match cost::CostTracker::new(config.cost.clone(), &config.workspace_dir) {
+                    Ok(tracker) => match tracker.get_summary() {
+                        Ok(summary) => {
+                            println!(
+                                "  Spent today:       ${:.4} / ${:.2}",
+                                summary.daily_cost_usd, config.cost.daily_limit_usd
+                            );
+                            println!(
+                                "  Spent this month:  ${:.4} / ${:.2}",
+                                summary.monthly_cost_usd, config.cost.monthly_limit_usd
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!("  ⚠ Could not load cost usage: {e}");
+                        }
+                    },
+                    Err(e) => {
+                        eprintln!("  ⚠ Could not init cost tracker: {e}");
+                    }
+                }
+            }
             println!("  OTP enabled:       {}", config.security.otp.enabled);
             println!("  E-stop enabled:    {}", config.security.estop.enabled);
             println!();
@@ -1564,6 +1684,142 @@ async fn main() -> Result<()> {
             }
         },
 
+        Commands::Props { props_command } => match props_command {
+            PropsCommands::List { filter, secrets } => {
+                let entries = config.prop_fields();
+                let mut current_category = "";
+                for entry in &entries {
+                    if secrets && !entry.is_secret {
+                        continue;
+                    }
+                    if let Some(ref f) = filter {
+                        if !entry.name.starts_with(f.as_str()) {
+                            continue;
+                        }
+                    }
+                    if entry.category != current_category {
+                        if !current_category.is_empty() {
+                            println!();
+                        }
+                        println!("{}:", entry.category);
+                        current_category = entry.category;
+                    }
+                    let lock = if entry.is_secret { " \u{1f512}" } else { "" };
+                    println!(
+                        "  {:<45} = {:<20} ({}){lock}",
+                        entry.name, entry.display_value, entry.type_hint
+                    );
+                }
+                Ok(())
+            }
+            PropsCommands::Get { path } => {
+                if Config::prop_is_secret(&path) {
+                    let entries = config.prop_fields();
+                    let is_set = entries
+                        .iter()
+                        .find(|e| e.name == path)
+                        .map(|e| e.display_value != "<unset>")
+                        .unwrap_or(false);
+                    if is_set {
+                        println!("{path} is set (encrypted secret \u{2014} value not displayed)");
+                    } else {
+                        println!("{path} is not set (encrypted secret)");
+                    }
+                } else {
+                    match config.get_prop(&path) {
+                        Ok(value) => println!("{value}"),
+                        Err(e) => anyhow::bail!("{e}"),
+                    }
+                }
+                Ok(())
+            }
+            PropsCommands::Set {
+                path,
+                value,
+                no_interactive,
+            } => {
+                if no_interactive {
+                    // Scripted mode: require value on CLI, no prompts
+                    let val = value.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Value required in --no-interactive mode. Usage: zeroclaw props set --no-interactive {path} <value>"
+                        )
+                    })?;
+                    config.set_prop(&path, &val)?;
+                } else if Config::prop_is_secret(&path) {
+                    if value.is_some() {
+                        eprintln!(
+                            "  \u{26a0} {path} is an encrypted secret \u{2014} using masked input."
+                        );
+                    }
+                    let secret_value = dialoguer::Password::new()
+                        .with_prompt(format!("Enter value for {path}"))
+                        .interact()?;
+                    let secret_value = secret_value.trim().to_string();
+                    if secret_value.is_empty() {
+                        anyhow::bail!("Value cannot be empty.");
+                    }
+                    config.set_prop(&path, &secret_value)?;
+                } else if let Some(val) = value {
+                    config.set_prop(&path, &val)?;
+                } else {
+                    // Enum fields get interactive selection; everything else needs a value
+                    let variants = config
+                        .prop_fields()
+                        .into_iter()
+                        .find(|f| f.name == path)
+                        .and_then(|info| {
+                            let get_variants = info.enum_variants?;
+                            let variants = get_variants();
+                            let current_index = variants
+                                .iter()
+                                .position(|v| v == &info.display_value)
+                                .unwrap_or(0);
+                            Some((variants, current_index))
+                        });
+                    if let Some((variants, current_index)) = variants {
+                        let selected = Select::new()
+                            .with_prompt(format!("Select value for {path}"))
+                            .items(&variants)
+                            .default(current_index)
+                            .interact()?;
+                        config.set_prop(&path, &variants[selected])?;
+                    } else {
+                        anyhow::bail!("Value required. Usage: zeroclaw props set {path} <value>");
+                    }
+                }
+                config.save().await?;
+                println!("{path} updated.");
+                Ok(())
+            }
+            PropsCommands::Init { section } => {
+                let initialized = config.init_defaults(section.as_deref());
+                if initialized.is_empty() {
+                    println!("All sections already configured.");
+                } else {
+                    println!(
+                        "Initialized {} section(s) with defaults:",
+                        initialized.len()
+                    );
+                    for name in &initialized {
+                        println!("  {name}");
+                    }
+                    config.save().await?;
+                    println!("\nRun `zeroclaw props list` to review, then set required fields.");
+                }
+                Ok(())
+            }
+            PropsCommands::Complete { partial } => {
+                let prefix = partial.as_deref().unwrap_or("");
+                for entry in config.prop_fields() {
+                    if entry.name.starts_with(prefix) {
+                        println!("{}", entry.name);
+                    }
+                }
+                Ok(())
+            }
+        },
+
         #[cfg(feature = "plugins-wasm")]
         Commands::Plugin { plugin_command } => match plugin_command {
             PluginCommands::List => {
@@ -1790,9 +2046,57 @@ fn write_shell_completion<W: Write>(shell: CompletionShell, writer: &mut W) -> R
     let bin_name = cmd.get_name().to_string();
 
     match shell {
-        CompletionShell::Bash => generate(shells::Bash, &mut cmd, bin_name.clone(), writer),
-        CompletionShell::Fish => generate(shells::Fish, &mut cmd, bin_name.clone(), writer),
-        CompletionShell::Zsh => generate(shells::Zsh, &mut cmd, bin_name.clone(), writer),
+        CompletionShell::Bash => {
+            generate(shells::Bash, &mut cmd, bin_name.clone(), writer);
+            // Wrap clap's _zeroclaw to inject dynamic props path completion
+            writeln!(
+                writer,
+                r#"
+# Dynamic completion for zeroclaw props get/set paths
+if type _zeroclaw &>/dev/null; then
+    _zeroclaw_clap_orig() {{ _zeroclaw "$@"; }}
+    _zeroclaw() {{
+        local cur="${{COMP_WORDS[COMP_CWORD]}}"
+        if [[ "${{COMP_WORDS[*]}}" =~ "props "(get|set)" " ]]; then
+            COMPREPLY=($(compgen -W "$(zeroclaw props complete "$cur" 2>/dev/null)" -- "$cur"))
+            return
+        fi
+        _zeroclaw_clap_orig "$@"
+    }}
+fi"#
+            )?;
+        }
+        CompletionShell::Fish => {
+            generate(shells::Fish, &mut cmd, bin_name.clone(), writer);
+            writeln!(
+                writer,
+                r#"
+# Dynamic completion for zeroclaw props get/set paths
+complete -c zeroclaw -n '__fish_seen_subcommand_from props; and __fish_seen_subcommand_from get set' \
+    -a '(zeroclaw props complete (commandline -ct) 2>/dev/null)' -f"#
+            )?;
+        }
+        CompletionShell::Zsh => {
+            generate(shells::Zsh, &mut cmd, bin_name.clone(), writer);
+            // Wrap clap's _zeroclaw to inject dynamic props path completion
+            writeln!(
+                writer,
+                r#"
+# Dynamic completion for zeroclaw props get/set paths
+if (( $+functions[_zeroclaw] )); then
+    functions[_zeroclaw_clap_orig]=$functions[_zeroclaw]
+    _zeroclaw() {{
+        if [[ "${{words[*]}}" == *"props "(get|set)* ]] && (( CURRENT > 3 )); then
+            local -a props
+            props=(${{(f)"$(zeroclaw props complete "$words[CURRENT]" 2>/dev/null)"}})
+            compadd -a props
+            return
+        fi
+        _zeroclaw_clap_orig "$@"
+    }}
+fi"#
+            )?;
+        }
         CompletionShell::PowerShell => {
             generate(shells::PowerShell, &mut cmd, bin_name.clone(), writer);
         }

@@ -26,6 +26,8 @@ use std::time::Instant;
 pub enum TurnEvent {
     /// A text chunk from the LLM response (may arrive many times).
     Chunk { delta: String },
+    /// A reasoning/thinking chunk from a thinking model (may arrive many times).
+    Thinking { delta: String },
     /// The agent is invoking a tool.
     ToolCall {
         name: String,
@@ -65,6 +67,13 @@ pub struct Agent {
     security_summary: Option<String>,
     /// Autonomy level from config; controls safety prompt instructions.
     autonomy_level: crate::security::AutonomyLevel,
+    /// Activated MCP tools for deferred loading mode.
+    /// When MCP deferred loading is enabled, tools are activated via `tool_search`
+    /// and stored here for lookup during tool execution.
+    activated_tools: Option<Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
+    /// Hook runner for tool-call auditing and lifecycle side effects.
+    /// See issue #5462.
+    hook_runner: Option<Arc<crate::hooks::HookRunner>>,
 }
 
 pub struct AgentBuilder {
@@ -92,6 +101,8 @@ pub struct AgentBuilder {
     tool_descriptions: Option<ToolDescriptions>,
     security_summary: Option<String>,
     autonomy_level: Option<crate::security::AutonomyLevel>,
+    activated_tools: Option<Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
+    hook_runner: Option<Arc<crate::hooks::HookRunner>>,
 }
 
 impl AgentBuilder {
@@ -121,6 +132,8 @@ impl AgentBuilder {
             tool_descriptions: None,
             security_summary: None,
             autonomy_level: None,
+            activated_tools: None,
+            hook_runner: None,
         }
     }
 
@@ -253,6 +266,19 @@ impl AgentBuilder {
         self
     }
 
+    pub fn activated_tools(
+        mut self,
+        activated: Option<Arc<std::sync::Mutex<tools::ActivatedToolSet>>>,
+    ) -> Self {
+        self.activated_tools = activated;
+        self
+    }
+
+    pub fn hook_runner(mut self, runner: Option<Arc<crate::hooks::HookRunner>>) -> Self {
+        self.hook_runner = runner;
+        self
+    }
+
     pub fn build(self) -> Result<Agent> {
         let mut tools = self
             .tools
@@ -308,6 +334,8 @@ impl AgentBuilder {
             autonomy_level: self
                 .autonomy_level
                 .unwrap_or(crate::security::AutonomyLevel::Supervised),
+            activated_tools: self.activated_tools,
+            hook_runner: self.hook_runner,
         })
     }
 }
@@ -377,28 +405,35 @@ impl Agent {
             None
         };
 
-        let (mut tools, delegate_handle, _reaction_handle, _channel_map_handle, _ask_user_handle) =
-            tools::all_tools_with_runtime(
-                Arc::new(config.clone()),
-                &security,
-                runtime,
-                memory.clone(),
-                composio_key,
-                composio_entity_id,
-                &config.browser,
-                &config.http_request,
-                &config.web_fetch,
-                &config.workspace_dir,
-                &config.agents,
-                config.api_key.as_deref(),
-                config,
-                None,
-            );
+        let (
+            mut tools,
+            delegate_handle,
+            _reaction_handle,
+            _channel_map_handle,
+            _ask_user_handle,
+            _escalate_handle,
+        ) = tools::all_tools_with_runtime(
+            Arc::new(config.clone()),
+            &security,
+            runtime,
+            memory.clone(),
+            composio_key,
+            composio_entity_id,
+            &config.browser,
+            &config.http_request,
+            &config.web_fetch,
+            &config.workspace_dir,
+            &config.agents,
+            config.api_key.as_deref(),
+            config,
+            None,
+        );
 
         // ── Wire MCP tools (non-fatal) ─────────────────────────────
         // Replicates the same MCP initialization logic used in the CLI
         // and webhook paths (loop_.rs) so that the WebSocket/daemon UI
         // path also has access to MCP tools.
+        let mut activated_tools: Option<Arc<std::sync::Mutex<tools::ActivatedToolSet>>> = None;
         if config.mcp.enabled && !config.mcp.servers.is_empty() {
             tracing::info!(
                 "Initializing MCP client — {} server(s) configured",
@@ -417,9 +452,9 @@ impl Agent {
                             deferred_set.len(),
                             registry.server_count()
                         );
-                        let activated = std::sync::Arc::new(std::sync::Mutex::new(
-                            tools::ActivatedToolSet::new(),
-                        ));
+                        let activated =
+                            Arc::new(std::sync::Mutex::new(tools::ActivatedToolSet::new()));
+                        activated_tools = Some(Arc::clone(&activated));
                         tools.push(Box::new(tools::ToolSearchTool::new(
                             deferred_set,
                             activated,
@@ -531,6 +566,21 @@ impl Agent {
             .auto_save(config.memory.auto_save)
             .security_summary(Some(security.prompt_summary()))
             .autonomy_level(config.autonomy.level)
+            .activated_tools(activated_tools)
+            .hook_runner(if config.hooks.enabled {
+                let mut runner = crate::hooks::HookRunner::new();
+                if config.hooks.builtin.command_logger {
+                    runner.register(Box::new(crate::hooks::builtin::CommandLoggerHook::new()));
+                }
+                if config.hooks.builtin.webhook_audit.enabled {
+                    runner.register(Box::new(crate::hooks::builtin::WebhookAuditHook::new(
+                        config.hooks.builtin.webhook_audit.clone(),
+                    )));
+                }
+                Some(Arc::new(runner))
+            } else {
+                None
+            })
             .build()
     }
 
@@ -553,7 +603,24 @@ impl Agent {
         }
 
         if other_messages.len() > max {
-            let drop_count = other_messages.len() - max;
+            let mut drop_count = other_messages.len() - max;
+
+            // Avoid creating orphan ToolResults: if the first message remaining
+            // after the drop is a ToolResults, its paired AssistantToolCalls was
+            // dropped, so the ToolResults must be dropped too. Otherwise the
+            // history would start with a tool_result block whose tool_use_id
+            // has no matching tool_use, causing providers (e.g. Anthropic) to
+            // reject the request with "messages.0.content.0: unexpected
+            // tool_use_id found in tool_result blocks".
+            while drop_count < other_messages.len()
+                && matches!(
+                    &other_messages[drop_count],
+                    ConversationMessage::ToolResults(_)
+                )
+            {
+                drop_count += 1;
+            }
+
             other_messages.drain(0..drop_count);
         }
 
@@ -581,37 +648,110 @@ impl Agent {
     async fn execute_tool_call(&self, call: &ParsedToolCall) -> ToolExecutionResult {
         let start = Instant::now();
 
-        let result = if let Some(tool) = self.tools.iter().find(|t| t.name() == call.name) {
-            match tool.execute(call.arguments.clone()).await {
-                Ok(r) => {
-                    self.observer.record_event(&ObserverEvent::ToolCall {
-                        tool: call.name.clone(),
-                        duration: start.elapsed(),
-                        success: r.success,
-                    });
-                    if r.success {
-                        r.output
-                    } else {
-                        format!("Error: {}", r.error.unwrap_or(r.output))
-                    }
+        // ── Hook: before_tool_call (modifying) ──────────────────
+        // Mirrors the hook pipeline in run_tool_call_loop (loop_.rs) so that
+        // library-integrated runs honour the same hook chain.  See #5462.
+        let mut tool_name = call.name.clone();
+        let mut tool_args = call.arguments.clone();
+        if let Some(ref hooks) = self.hook_runner {
+            match hooks
+                .run_before_tool_call(tool_name.clone(), tool_args.clone())
+                .await
+            {
+                crate::hooks::HookResult::Continue((n, a)) => {
+                    tool_name = n;
+                    tool_args = a;
                 }
-                Err(e) => {
-                    self.observer.record_event(&ObserverEvent::ToolCall {
-                        tool: call.name.clone(),
-                        duration: start.elapsed(),
+                crate::hooks::HookResult::Cancel(reason) => {
+                    tracing::info!(
+                        tool = %call.name, %reason,
+                        "tool call cancelled by hook"
+                    );
+                    return ToolExecutionResult {
+                        name: call.name.clone(),
+                        output: format!("Cancelled by hook: {reason}"),
                         success: false,
-                    });
-                    format!("Error executing {}: {e}", call.name)
+                        tool_call_id: call.tool_call_id.clone(),
+                    };
                 }
             }
-        } else {
-            format!("Unknown tool: {}", call.name)
-        };
+        }
+
+        // First try to find tool in static registry, then in activated MCP tools.
+        let (result, success) =
+            if let Some(tool) = self.tools.iter().find(|t| t.name() == tool_name) {
+                match tool.execute(tool_args.clone()).await {
+                    Ok(r) => {
+                        self.observer.record_event(&ObserverEvent::ToolCall {
+                            tool: tool_name.clone(),
+                            duration: start.elapsed(),
+                            success: r.success,
+                        });
+                        if r.success {
+                            (r.output, true)
+                        } else {
+                            (format!("Error: {}", r.error.unwrap_or(r.output)), false)
+                        }
+                    }
+                    Err(e) => {
+                        self.observer.record_event(&ObserverEvent::ToolCall {
+                            tool: tool_name.clone(),
+                            duration: start.elapsed(),
+                            success: false,
+                        });
+                        (format!("Error executing {}: {e}", tool_name), false)
+                    }
+                }
+            } else if let Some(activated_arc) = self.activated_tools.as_ref() {
+                let activated_opt = activated_arc.lock().unwrap().get_resolved(&tool_name);
+                if let Some(tool) = activated_opt {
+                    match tool.execute(tool_args.clone()).await {
+                        Ok(r) => {
+                            self.observer.record_event(&ObserverEvent::ToolCall {
+                                tool: tool_name.clone(),
+                                duration: start.elapsed(),
+                                success: r.success,
+                            });
+                            if r.success {
+                                (r.output, true)
+                            } else {
+                                (format!("Error: {}", r.error.unwrap_or(r.output)), false)
+                            }
+                        }
+                        Err(e) => {
+                            self.observer.record_event(&ObserverEvent::ToolCall {
+                                tool: tool_name.clone(),
+                                duration: start.elapsed(),
+                                success: false,
+                            });
+                            (format!("Error executing {}: {e}", tool_name), false)
+                        }
+                    }
+                } else {
+                    (format!("Unknown tool: {}", tool_name), false)
+                }
+            } else {
+                (format!("Unknown tool: {}", tool_name), false)
+            };
+
+        let duration = start.elapsed();
+
+        // ── Hook: after_tool_call (void) ─────────────────────────
+        if let Some(ref hooks) = self.hook_runner {
+            let tool_result_obj = crate::tools::ToolResult {
+                success,
+                output: result.clone(),
+                error: None,
+            };
+            hooks
+                .fire_after_tool_call(&tool_name, &tool_result_obj, duration)
+                .await;
+        }
 
         ToolExecutionResult {
-            name: call.name.clone(),
+            name: tool_name,
             output: result,
-            success: true,
+            success,
             tool_call_id: call.tool_call_id.clone(),
         }
     }
@@ -748,7 +888,7 @@ impl Agent {
                 None
             };
 
-            if let (Some(ref cache), Some(ref key)) = (&self.response_cache, &cache_key) {
+            if let (Some(cache), Some(key)) = (&self.response_cache, &cache_key) {
                 if let Ok(Some(cached)) = cache.get(key) {
                     self.observer.record_event(&ObserverEvent::CacheHit {
                         cache_type: "response".into(),
@@ -795,7 +935,7 @@ impl Agent {
                 };
 
                 // Store in response cache (text-only, no tool calls)
-                if let (Some(ref cache), Some(ref key)) = (&self.response_cache, &cache_key) {
+                if let (Some(cache), Some(key)) = (&self.response_cache, &cache_key) {
                     let token_count = response
                         .usage
                         .as_ref()
@@ -923,7 +1063,7 @@ impl Agent {
                 None
             };
 
-            if let (Some(ref cache), Some(ref key)) = (&self.response_cache, &cache_key) {
+            if let (Some(cache), Some(key)) = (&self.response_cache, &cache_key) {
                 if let Ok(Some(cached)) = cache.get(key) {
                     self.observer.record_event(&ObserverEvent::CacheHit {
                         cache_type: "response".into(),
@@ -947,25 +1087,72 @@ impl Agent {
             use futures_util::StreamExt;
 
             let stream_opts = crate::providers::traits::StreamOptions::new(true);
-            let mut stream = self.provider.stream_chat_with_history(
-                &messages,
+            let mut stream = self.provider.stream_chat(
+                crate::providers::ChatRequest {
+                    messages: &messages,
+                    tools: if self.tool_dispatcher.should_send_tool_specs() {
+                        Some(&self.tool_specs)
+                    } else {
+                        None
+                    },
+                },
                 &effective_model,
                 self.temperature,
                 stream_opts,
             );
 
             let mut streamed_text = String::new();
+            let mut streamed_tool_calls: Vec<crate::providers::traits::ToolCall> = Vec::new();
             let mut got_stream = false;
 
             while let Some(item) = stream.next().await {
                 match item {
-                    Ok(chunk) => {
-                        if !chunk.delta.is_empty() {
-                            got_stream = true;
-                            streamed_text.push_str(&chunk.delta);
-                            let _ = event_tx.send(TurnEvent::Chunk { delta: chunk.delta }).await;
+                    Ok(event) => match event {
+                        crate::providers::traits::StreamEvent::TextDelta(chunk) => {
+                            if let Some(reasoning) = chunk.reasoning {
+                                if !reasoning.is_empty() {
+                                    let _ = event_tx
+                                        .send(TurnEvent::Thinking { delta: reasoning })
+                                        .await;
+                                }
+                            }
+                            if !chunk.delta.is_empty() {
+                                got_stream = true;
+                                streamed_text.push_str(&chunk.delta);
+                                let _ =
+                                    event_tx.send(TurnEvent::Chunk { delta: chunk.delta }).await;
+                            }
                         }
-                    }
+                        crate::providers::traits::StreamEvent::ToolCall(tc) => {
+                            got_stream = true;
+                            let _ = event_tx
+                                .send(TurnEvent::ToolCall {
+                                    name: tc.name.clone(),
+                                    args: serde_json::from_str(&tc.arguments).unwrap_or_default(),
+                                })
+                                .await;
+                            streamed_tool_calls.push(tc);
+                        }
+                        crate::providers::traits::StreamEvent::PreExecutedToolCall {
+                            name,
+                            args,
+                        } => {
+                            let _ = event_tx
+                                .send(TurnEvent::ToolCall {
+                                    name,
+                                    args: serde_json::from_str(&args).unwrap_or_default(),
+                                })
+                                .await;
+                            // NOT pushed to streamed_tool_calls — already executed by proxy
+                        }
+                        crate::providers::traits::StreamEvent::PreExecutedToolResult {
+                            name,
+                            output,
+                        } => {
+                            let _ = event_tx.send(TurnEvent::ToolResult { name, output }).await;
+                        }
+                        crate::providers::traits::StreamEvent::Final => break,
+                    },
                     Err(_) => break,
                 }
             }
@@ -978,7 +1165,7 @@ impl Agent {
                 // Build a synthetic ChatResponse from streamed text
                 crate::providers::ChatResponse {
                     text: Some(streamed_text),
-                    tool_calls: Vec::new(),
+                    tool_calls: streamed_tool_calls,
                     usage: None,
                     reasoning_content: None,
                 }
@@ -1014,7 +1201,7 @@ impl Agent {
                 };
 
                 // Store in response cache
-                if let (Some(ref cache), Some(ref key)) = (&self.response_cache, &cache_key) {
+                if let (Some(cache), Some(key)) = (&self.response_cache, &cache_key) {
                     let token_count = response
                         .usage
                         .as_ref()
@@ -1358,10 +1545,12 @@ mod tests {
 
         let response = agent.turn("hi").await.unwrap();
         assert_eq!(response, "done");
-        assert!(agent
-            .history()
-            .iter()
-            .any(|msg| matches!(msg, ConversationMessage::ToolResults(_))));
+        assert!(
+            agent
+                .history()
+                .iter()
+                .any(|msg| matches!(msg, ConversationMessage::ToolResults(_)))
+        );
     }
 
     #[tokio::test]
@@ -1420,7 +1609,7 @@ mod tests {
 
     #[tokio::test]
     async fn from_config_passes_extra_headers_to_custom_provider() {
-        use axum::{http::HeaderMap, routing::post, Json, Router};
+        use axum::{Json, Router, http::HeaderMap, routing::post};
         use tempfile::TempDir;
         use tokio::net::TcpListener;
 
@@ -1614,5 +1803,275 @@ mod tests {
             matches!(&history[2], ConversationMessage::Chat(m) if m.role == "assistant" && m.content == "hi there")
         );
         assert_eq!(history.len(), 3);
+    }
+
+    /// Mock provider that captures whether tool specs were passed to `stream_chat`
+    /// and returns a tool call followed by a text response through the stream.
+    struct StreamToolCaptureProvider {
+        tools_received: Arc<Mutex<Vec<bool>>>,
+        call_count: Arc<Mutex<usize>>,
+    }
+
+    #[async_trait]
+    impl Provider for StreamToolCaptureProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> Result<String> {
+            Ok("ok".into())
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: f64,
+        ) -> Result<crate::providers::ChatResponse> {
+            self.tools_received.lock().push(request.tools.is_some());
+            let mut count = self.call_count.lock();
+            *count += 1;
+            if *count == 1 {
+                Ok(crate::providers::ChatResponse {
+                    text: Some(String::new()),
+                    tool_calls: vec![crate::providers::ToolCall {
+                        id: "tc_stream_1".into(),
+                        name: "echo".into(),
+                        arguments: "{}".into(),
+                    }],
+                    usage: None,
+                    reasoning_content: None,
+                })
+            } else {
+                Ok(crate::providers::ChatResponse {
+                    text: Some("stream-done".into()),
+                    tool_calls: vec![],
+                    usage: None,
+                    reasoning_content: None,
+                })
+            }
+        }
+
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: f64,
+            _options: crate::providers::traits::StreamOptions,
+        ) -> futures_util::stream::BoxStream<
+            'static,
+            crate::providers::traits::StreamResult<crate::providers::traits::StreamEvent>,
+        > {
+            use futures_util::stream::{self, StreamExt};
+            self.tools_received.lock().push(request.tools.is_some());
+            let mut count = self.call_count.lock();
+            *count += 1;
+            if *count == 1 {
+                let tc =
+                    crate::providers::traits::StreamEvent::ToolCall(crate::providers::ToolCall {
+                        id: "tc_stream_1".into(),
+                        name: "echo".into(),
+                        arguments: "{}".into(),
+                    });
+                stream::iter(vec![
+                    Ok(tc),
+                    Ok(crate::providers::traits::StreamEvent::Final),
+                ])
+                .boxed()
+            } else {
+                let chunk = crate::providers::traits::StreamEvent::TextDelta(
+                    crate::providers::traits::StreamChunk {
+                        delta: "stream-done".into(),
+                        is_final: false,
+                        reasoning: None,
+                        token_count: 0,
+                    },
+                );
+                stream::iter(vec![
+                    Ok(chunk),
+                    Ok(crate::providers::traits::StreamEvent::Final),
+                ])
+                .boxed()
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn turn_streamed_passes_tool_specs_to_provider() {
+        let tools_received = Arc::new(Mutex::new(Vec::new()));
+        let provider = Box::new(StreamToolCaptureProvider {
+            tools_received: tools_received.clone(),
+            call_count: Arc::new(Mutex::new(0)),
+        });
+
+        let memory_cfg = crate::config::MemoryConfig {
+            backend: "none".into(),
+            ..crate::config::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            crate::memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .provider(provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        let response = agent
+            .turn_streamed("use the echo tool", event_tx)
+            .await
+            .unwrap();
+        assert_eq!(response, "stream-done");
+
+        // Verify tools were passed in both stream_chat calls
+        let received = tools_received.lock();
+        assert!(
+            received.len() >= 2,
+            "Expected at least 2 stream_chat calls, got {}",
+            received.len()
+        );
+        assert!(
+            received[0],
+            "First stream_chat call should have received tool specs"
+        );
+        assert!(
+            received[1],
+            "Second stream_chat call should have received tool specs"
+        );
+
+        // Collect events and verify tool call + tool result were emitted
+        let mut events = Vec::new();
+        while let Ok(ev) = event_rx.try_recv() {
+            events.push(ev);
+        }
+        let has_tool_call = events
+            .iter()
+            .any(|e| matches!(e, TurnEvent::ToolCall { name, .. } if name == "echo"));
+        let has_tool_result = events
+            .iter()
+            .any(|e| matches!(e, TurnEvent::ToolResult { name, .. } if name == "echo"));
+        assert!(
+            has_tool_call,
+            "Should have emitted a ToolCall event for 'echo'"
+        );
+        assert!(
+            has_tool_result,
+            "Should have emitted a ToolResult event for 'echo'"
+        );
+    }
+
+    /// Reproduction test for the orphan-tool_results trim bug.
+    ///
+    /// `trim_history` previously dropped the oldest N entries blindly. When
+    /// the boundary fell in the middle of an `AssistantToolCalls` /
+    /// `ToolResults` pair, the call side was dropped while the result side
+    /// remained — leaving an orphan `ToolResults` at the head of the
+    /// history. The next provider request then started with a `tool_result`
+    /// block that had no matching `tool_use`, which Anthropic rejects with:
+    ///
+    ///   `messages.0.content.0: unexpected tool_use_id found in tool_result blocks`
+    ///
+    /// To reliably reproduce the bug we need the drop boundary to fall in
+    /// the middle of a pair. Five entries (`AC1, TR1, AC2, TR2, AC3`) with
+    /// `max = 4` makes `drop_count = 1`, which removes `AC1` and leaves
+    /// `TR1` as an orphan at the head.
+    #[test]
+    fn trim_history_does_not_leave_orphan_tool_results() {
+        use crate::providers::{ToolCall, ToolResultMessage};
+
+        let memory_cfg = crate::config::MemoryConfig {
+            backend: "none".into(),
+            ..crate::config::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            crate::memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+
+        let mut agent_config = crate::config::AgentConfig::default();
+        // Force trimming with the boundary landing inside a pair:
+        // 5 entries (AC, TR, AC, TR, AC) > 4 → drop_count = 1 → AC1 dropped,
+        // TR1 left as an orphan unless the trim guards against it.
+        agent_config.max_history_messages = 4;
+
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .provider(Box::new(MockProvider {
+                responses: Mutex::new(vec![]),
+            }))
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .config(agent_config)
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        // Build the history: AC1, TR1, AC2, TR2, AC3 (no trailing TR3).
+        for i in 1..=3 {
+            agent.history.push(ConversationMessage::AssistantToolCalls {
+                text: Some(format!("Calling tool {i}")),
+                tool_calls: vec![ToolCall {
+                    id: format!("tc{i}"),
+                    name: format!("tool{i}"),
+                    arguments: "{}".into(),
+                }],
+                reasoning_content: None,
+            });
+            // Skip the trailing ToolResults for the last AssistantToolCalls
+            // so the entry count is 5, not 6, and the drop boundary lands
+            // mid-pair.
+            if i < 3 {
+                agent
+                    .history
+                    .push(ConversationMessage::ToolResults(vec![ToolResultMessage {
+                        tool_call_id: format!("tc{i}"),
+                        content: format!("result{i}"),
+                    }]));
+            }
+        }
+
+        assert_eq!(agent.history.len(), 5);
+        agent.trim_history();
+
+        // After trimming, the surviving history must not start with a
+        // ToolResults entry (that would be an orphan whose AssistantToolCalls
+        // partner was dropped).
+        if let Some(first) = agent.history.first() {
+            assert!(
+                !matches!(first, ConversationMessage::ToolResults(_)),
+                "trim_history left an orphan ToolResults at the head of the \
+                 history; this would cause Anthropic to reject the next \
+                 request with 'unexpected tool_use_id found in tool_result \
+                 blocks'"
+            );
+        }
+
+        // Every ToolResults entry must be immediately preceded by an
+        // AssistantToolCalls entry.
+        for window in agent.history.windows(2) {
+            if matches!(&window[1], ConversationMessage::ToolResults(_)) {
+                assert!(
+                    matches!(&window[0], ConversationMessage::AssistantToolCalls { .. }),
+                    "ToolResults entry is not preceded by an AssistantToolCalls \
+                     entry — pair was split during trim"
+                );
+            }
+        }
     }
 }

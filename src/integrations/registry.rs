@@ -773,8 +773,8 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::schema::{IMessageConfig, MatrixConfig, StreamMode, TelegramConfig};
     use crate::config::Config;
+    use crate::config::schema::{IMessageConfig, MatrixConfig, StreamMode, TelegramConfig};
 
     #[test]
     fn registry_has_entries() {
@@ -834,6 +834,7 @@ mod tests {
     fn telegram_active_when_configured() {
         let mut config = Config::default();
         config.channels_config.telegram = Some(TelegramConfig {
+            enabled: true,
             bot_token: "123:ABC".into(),
             allowed_users: vec!["user".into()],
             stream_mode: StreamMode::default(),
@@ -863,6 +864,7 @@ mod tests {
     fn imessage_active_when_configured() {
         let mut config = Config::default();
         config.channels_config.imessage = Some(IMessageConfig {
+            enabled: true,
             allowed_contacts: vec!["*".into()],
         });
         let entries = all_integrations();
@@ -885,6 +887,7 @@ mod tests {
     fn matrix_active_when_configured() {
         let mut config = Config::default();
         config.channels_config.matrix = Some(MatrixConfig {
+            enabled: true,
             homeserver: "https://m.org".into(),
             access_token: "tok".into(),
             user_id: None,
@@ -893,6 +896,10 @@ mod tests {
             allowed_users: vec![],
             allowed_rooms: vec![],
             interrupt_on_new_message: false,
+            stream_mode: crate::config::StreamMode::default(),
+            draft_update_interval_ms: 1500,
+            multi_message_delay_ms: 800,
+            recovery_key: None,
         });
         let entries = all_integrations();
         let mx = entries.iter().find(|e| e.name == "Matrix").unwrap();

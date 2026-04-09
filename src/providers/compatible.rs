@@ -9,10 +9,10 @@ use crate::providers::traits::{
     ToolCall as ProviderToolCall,
 };
 use async_trait::async_trait;
-use futures_util::{stream, StreamExt};
+use futures_util::{StreamExt, stream};
 use reqwest::{
-    header::{HeaderMap, HeaderValue, USER_AGENT},
     Client,
+    header::{HeaderMap, HeaderValue, USER_AGENT},
 };
 use serde::{Deserialize, Serialize};
 
@@ -59,6 +59,66 @@ pub enum AuthStyle {
     XApiKey,
     /// Custom header name
     Custom(String),
+    /// Zhipu/GLM JWT auth: the credential is `id.secret`, and a short-lived
+    /// JWT (HMAC-SHA256, 3.5 min expiry) is generated per request.
+    /// Used by Z.AI and GLM providers.
+    ZhipuJwt,
+}
+
+/// Generate a Zhipu JWT from an `id.secret` API key.
+/// Returns `Authorization: Bearer <jwt>` value. Token is valid for 3.5 minutes.
+fn zhipu_jwt_bearer(credential: &str) -> Result<String, String> {
+    let (id, secret) = credential
+        .split_once('.')
+        .ok_or_else(|| "Zhipu API key must be in 'id.secret' format".to_string())?;
+
+    #[allow(clippy::cast_possible_truncation)] // millis won't exceed u64 until year 584 million
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_millis() as u64;
+    let exp_ms = now_ms + 210_000; // 3.5 minutes
+
+    // Header: {"alg":"HS256","typ":"JWT","sign_type":"SIGN"}
+    let header_b64 = base64url_no_pad(br#"{"alg":"HS256","typ":"JWT","sign_type":"SIGN"}"#);
+    let payload = format!(r#"{{"api_key":"{id}","exp":{exp_ms},"timestamp":{now_ms}}}"#);
+    let payload_b64 = base64url_no_pad(payload.as_bytes());
+
+    let signing_input = format!("{header_b64}.{payload_b64}");
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, secret.as_bytes());
+    let sig = ring::hmac::sign(&key, signing_input.as_bytes());
+    let sig_b64 = base64url_no_pad(sig.as_ref());
+
+    Ok(format!("Bearer {signing_input}.{sig_b64}"))
+}
+
+fn base64url_no_pad(data: &[u8]) -> String {
+    use base64::engine::{Engine, general_purpose::URL_SAFE_NO_PAD};
+    URL_SAFE_NO_PAD.encode(data)
+}
+
+/// Apply auth to a request builder (usable from spawned tasks without `&self`).
+///
+/// When `credential` is `None` (e.g. local LLM servers that require no API key),
+/// the request is returned unchanged -- no auth header is added.
+fn apply_auth_to_request(
+    req: reqwest::RequestBuilder,
+    style: &AuthStyle,
+    credential: Option<&str>,
+) -> reqwest::RequestBuilder {
+    let credential = match credential {
+        Some(c) => c,
+        None => return req,
+    };
+    match style {
+        AuthStyle::Bearer => req.header("Authorization", format!("Bearer {credential}")),
+        AuthStyle::XApiKey => req.header("x-api-key", credential),
+        AuthStyle::Custom(header) => req.header(header, credential),
+        AuthStyle::ZhipuJwt => match zhipu_jwt_bearer(credential) {
+            Ok(val) => req.header("Authorization", val),
+            Err(_) => req.header("Authorization", format!("Bearer {credential}")),
+        },
+    }
 }
 
 impl OpenAiCompatibleProvider {
@@ -192,6 +252,13 @@ impl OpenAiCompatibleProvider {
     /// Disable native tool calling, forcing prompt-guided tool use instead.
     pub fn without_native_tools(mut self) -> Self {
         self.native_tool_calling = false;
+        self
+    }
+
+    /// Merge all system messages into the first user message before sending.
+    /// Unlike `new_merge_system_into_user`, this preserves native tool calling.
+    pub fn with_merge_system_into_user(mut self) -> Self {
+        self.merge_system_into_user = true;
         self
     }
 
@@ -393,16 +460,35 @@ impl OpenAiCompatibleProvider {
         tools
             .iter()
             .map(|tool| {
+                let params = crate::tools::SchemaCleanr::clean_for_openai(tool.parameters.clone());
                 serde_json::json!({
                     "type": "function",
                     "function": {
                         "name": tool.name,
                         "description": tool.description,
-                        "parameters": tool.parameters
+                        "parameters": params
                     }
                 })
             })
             .collect()
+    }
+
+    /// Returns true if the given model requires system messages to be merged
+    /// into the first user message because its prompt template cannot handle
+    /// the `system` role reliably (e.g. DeepSeek V3.2 Jinja rendering errors).
+    fn model_requires_system_merge(model: &str) -> bool {
+        let id = model
+            .rsplit('/')
+            .next()
+            .unwrap_or(model)
+            .to_ascii_lowercase();
+        id.contains("deepseek-v3") || id.contains("deepseek_v3")
+    }
+
+    /// Whether system messages should be flattened into the first user message,
+    /// either because the provider was configured that way or the model requires it.
+    fn effective_merge_system(&self, model: &str) -> bool {
+        self.merge_system_into_user || Self::model_requires_system_merge(model)
     }
 
     fn reasoning_effort_for_model(&self, model: &str) -> Option<String> {
@@ -860,6 +946,44 @@ fn parse_sse_chunk(line: &str) -> StreamResult<Option<StreamChunkResponse>> {
         .map_err(StreamError::Json)
 }
 
+/// Parse custom proxy tool events from SSE lines.
+/// These are emitted by proxies like claude-max-api-proxy that execute tools
+/// internally and forward observability events via custom SSE fields.
+fn parse_proxy_tool_event(line: &str) -> Option<StreamEvent> {
+    let data = line.trim().strip_prefix("data:")?.trim();
+    let obj: serde_json::Value = serde_json::from_str(data).ok()?;
+
+    if let Some(ts) = obj.get("x_tool_start") {
+        let Some(name) = ts.get("name").and_then(|v| v.as_str()) else {
+            tracing::debug!("proxy x_tool_start event missing required 'name' field");
+            return None;
+        };
+        let name = name.to_string();
+        let args = ts
+            .get("arguments")
+            .and_then(|v| v.as_str())
+            .unwrap_or("{}")
+            .to_string();
+        return Some(StreamEvent::PreExecutedToolCall { name, args });
+    }
+
+    if let Some(tr) = obj.get("x_tool_result") {
+        let name = tr
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+        let output = tr
+            .get("output")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        return Some(StreamEvent::PreExecutedToolResult { name, output });
+    }
+
+    None
+}
+
 fn extract_sse_text_delta(choice: &StreamChoice) -> Option<String> {
     if let Some(content) = &choice.delta.content {
         if !content.is_empty() {
@@ -867,6 +991,10 @@ fn extract_sse_text_delta(choice: &StreamChoice) -> Option<String> {
         }
     }
 
+    None
+}
+
+fn extract_sse_reasoning_delta(choice: &StreamChoice) -> Option<String> {
     choice
         .delta
         .reasoning_content
@@ -877,9 +1005,30 @@ fn extract_sse_text_delta(choice: &StreamChoice) -> Option<String> {
 
 /// Parse SSE (Server-Sent Events) stream from OpenAI-compatible providers.
 /// Handles the `data: {...}` format and `[DONE]` sentinel.
-fn parse_sse_line(line: &str) -> StreamResult<Option<String>> {
-    Ok(parse_sse_chunk(line)?
-        .and_then(|chunk| chunk.choices.first().and_then(extract_sse_text_delta)))
+///
+/// Returns a `StreamChunk` that distinguishes content from reasoning:
+/// - Content deltas → `StreamChunk::delta`
+/// - Reasoning deltas → `StreamChunk::reasoning`
+fn parse_sse_line(line: &str) -> StreamResult<Option<StreamChunk>> {
+    let chunk = match parse_sse_chunk(line)? {
+        Some(c) => c,
+        None => return Ok(None),
+    };
+
+    if let Some(choice) = chunk.choices.first() {
+        if let Some(content) = &choice.delta.content {
+            if !content.is_empty() {
+                return Ok(Some(StreamChunk::delta(content.clone())));
+            }
+        }
+        if let Some(reasoning) = &choice.delta.reasoning_content {
+            if !reasoning.is_empty() {
+                return Ok(Some(StreamChunk::reasoning(reasoning.clone())));
+            }
+        }
+    }
+
+    Ok(None)
 }
 
 /// Convert SSE byte stream to text chunks.
@@ -901,22 +1050,35 @@ fn sse_bytes_to_chunks(
         }
 
         let mut bytes_stream = response.bytes_stream();
+        // Accumulate partial UTF-8 sequences that may be split across
+        // HTTP/1.1 chunked transfer boundaries (e.g. 3-byte CJK chars).
+        let mut utf8_buf: Vec<u8> = Vec::new();
 
         while let Some(item) = bytes_stream.next().await {
             match item {
                 Ok(bytes) => {
-                    let text = match String::from_utf8(bytes.to_vec()) {
-                        Ok(t) => t,
+                    utf8_buf.extend_from_slice(&bytes);
+                    let text = match std::str::from_utf8(&utf8_buf) {
+                        Ok(s) => {
+                            let owned = s.to_string();
+                            utf8_buf.clear();
+                            owned
+                        }
                         Err(e) => {
-                            let _ = tx
-                                .send(Err(StreamError::InvalidSse(format!(
-                                    "Invalid UTF-8: {}",
-                                    e
-                                ))))
-                                .await;
-                            break;
+                            let valid_up_to = e.valid_up_to();
+                            if valid_up_to == 0 && utf8_buf.len() < 4 {
+                                // Could still be an incomplete multi-byte char; wait for more data
+                                continue;
+                            }
+                            let valid =
+                                String::from_utf8_lossy(&utf8_buf[..valid_up_to]).into_owned();
+                            utf8_buf.drain(..valid_up_to);
+                            valid
                         }
                     };
+                    if text.is_empty() {
+                        continue;
+                    }
 
                     buffer.push_str(&text);
 
@@ -925,11 +1087,12 @@ fn sse_bytes_to_chunks(
                         buffer.drain(..=pos);
 
                         match parse_sse_line(&line) {
-                            Ok(Some(content)) => {
-                                let mut chunk = StreamChunk::delta(content);
-                                if count_tokens {
-                                    chunk = chunk.with_token_estimate();
-                                }
+                            Ok(Some(chunk)) => {
+                                let chunk = if count_tokens {
+                                    chunk.with_token_estimate()
+                                } else {
+                                    chunk
+                                };
                                 if tx.send(Ok(chunk)).await.is_err() {
                                     return; // Receiver dropped
                                 }
@@ -979,27 +1142,47 @@ fn sse_bytes_to_events(
         }
 
         let mut bytes_stream = response.bytes_stream();
+        // Accumulate partial UTF-8 sequences split across chunk boundaries.
+        let mut utf8_buf: Vec<u8> = Vec::new();
         while let Some(item) = bytes_stream.next().await {
             match item {
                 Ok(bytes) => {
-                    let text = match String::from_utf8(bytes.to_vec()) {
-                        Ok(t) => t,
+                    utf8_buf.extend_from_slice(&bytes);
+                    let text = match std::str::from_utf8(&utf8_buf) {
+                        Ok(s) => {
+                            let owned = s.to_string();
+                            utf8_buf.clear();
+                            owned
+                        }
                         Err(e) => {
-                            let _ = tx
-                                .send(Err(StreamError::InvalidSse(format!(
-                                    "Invalid UTF-8: {}",
-                                    e
-                                ))))
-                                .await;
-                            return;
+                            let valid_up_to = e.valid_up_to();
+                            if valid_up_to == 0 && utf8_buf.len() < 4 {
+                                continue;
+                            }
+                            let valid =
+                                String::from_utf8_lossy(&utf8_buf[..valid_up_to]).into_owned();
+                            utf8_buf.drain(..valid_up_to);
+                            valid
                         }
                     };
+                    if text.is_empty() {
+                        continue;
+                    }
 
                     buffer.push_str(&text);
 
                     while let Some(pos) = buffer.find('\n') {
                         let line = buffer[..pos].to_string();
                         buffer.drain(..=pos);
+
+                        // Custom proxy events for pre-executed tool calls
+                        // (e.g. claude-max-api-proxy streaming x_tool_start/x_tool_result)
+                        if let Some(event) = parse_proxy_tool_event(&line) {
+                            if tx.send(Ok(event)).await.is_err() {
+                                return;
+                            }
+                            continue;
+                        }
 
                         let chunk = match parse_sse_chunk(&line) {
                             Ok(Some(chunk)) => chunk,
@@ -1012,6 +1195,16 @@ fn sse_bytes_to_events(
 
                         let mut should_emit_tool_calls = false;
                         for choice in &chunk.choices {
+                            if let Some(reasoning_delta) = extract_sse_reasoning_delta(choice) {
+                                let reasoning_chunk = StreamChunk::reasoning(reasoning_delta);
+                                if tx
+                                    .send(Ok(StreamEvent::TextDelta(reasoning_chunk)))
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                            }
                             if let Some(text_delta) = extract_sse_text_delta(choice) {
                                 let mut text_chunk = StreamChunk::delta(text_delta);
                                 if count_tokens {
@@ -1184,18 +1377,14 @@ impl OpenAiCompatibleProvider {
     fn apply_auth_header(
         &self,
         req: reqwest::RequestBuilder,
-        credential: &str,
+        credential: Option<&str>,
     ) -> reqwest::RequestBuilder {
-        match &self.auth_header {
-            AuthStyle::Bearer => req.header("Authorization", format!("Bearer {credential}")),
-            AuthStyle::XApiKey => req.header("x-api-key", credential),
-            AuthStyle::Custom(header) => req.header(header, credential),
-        }
+        apply_auth_to_request(req, &self.auth_header, credential)
     }
 
     async fn chat_via_responses(
         &self,
-        credential: &str,
+        credential: Option<&str>,
         messages: &[ChatMessage],
         model: &str,
     ) -> anyhow::Result<String> {
@@ -1240,12 +1429,14 @@ impl OpenAiCompatibleProvider {
             items
                 .iter()
                 .map(|tool| {
+                    let params =
+                        crate::tools::SchemaCleanr::clean_for_openai(tool.parameters.clone());
                     serde_json::json!({
                         "type": "function",
                         "function": {
                             "name": tool.name,
                             "description": tool.description,
-                            "parameters": tool.parameters,
+                            "parameters": params,
                         }
                     })
                 })
@@ -1479,23 +1670,19 @@ impl Provider for OpenAiCompatibleProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<String> {
-        let credential = self.credential.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "{} API key not set. Run `zeroclaw onboard` or set the appropriate env var.",
-                self.name
-            )
-        })?;
+        let credential = self.credential.as_deref();
 
+        let merge = self.effective_merge_system(model);
         let mut messages = Vec::new();
 
-        if self.merge_system_into_user {
+        if merge {
             let content = match system_prompt {
                 Some(sys) => format!("{sys}\n\n{message}"),
                 None => message.to_string(),
             };
             messages.push(Message {
                 role: "user".to_string(),
-                content: Self::to_message_content("user", &content, !self.merge_system_into_user),
+                content: Self::to_message_content("user", &content, !merge),
             });
         } else {
             if let Some(sys) = system_prompt {
@@ -1529,7 +1716,7 @@ impl Provider for OpenAiCompatibleProvider {
             fallback_messages.push(ChatMessage::system(system_prompt));
         }
         fallback_messages.push(ChatMessage::user(message));
-        let fallback_messages = if self.merge_system_into_user {
+        let fallback_messages = if merge {
             Self::flatten_system_messages(&fallback_messages)
         } else {
             fallback_messages
@@ -1611,14 +1798,10 @@ impl Provider for OpenAiCompatibleProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<String> {
-        let credential = self.credential.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "{} API key not set. Run `zeroclaw onboard` or set the appropriate env var.",
-                self.name
-            )
-        })?;
+        let credential = self.credential.as_deref();
 
-        let effective_messages = if self.merge_system_into_user {
+        let merge = self.effective_merge_system(model);
+        let effective_messages = if merge {
             Self::flatten_system_messages(messages)
         } else {
             messages.to_vec()
@@ -1627,11 +1810,7 @@ impl Provider for OpenAiCompatibleProvider {
             .iter()
             .map(|m| Message {
                 role: m.role.clone(),
-                content: Self::to_message_content(
-                    &m.role,
-                    &m.content,
-                    !self.merge_system_into_user,
-                ),
+                content: Self::to_message_content(&m.role, &m.content, !merge),
             })
             .collect();
 
@@ -1724,14 +1903,10 @@ impl Provider for OpenAiCompatibleProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<ProviderChatResponse> {
-        let credential = self.credential.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "{} API key not set. Run `zeroclaw onboard` or set the appropriate env var.",
-                self.name
-            )
-        })?;
+        let credential = self.credential.as_deref();
 
-        let effective_messages = if self.merge_system_into_user {
+        let merge = self.effective_merge_system(model);
+        let effective_messages = if merge {
             Self::flatten_system_messages(messages)
         } else {
             messages.to_vec()
@@ -1740,11 +1915,7 @@ impl Provider for OpenAiCompatibleProvider {
             .iter()
             .map(|m| Message {
                 role: m.role.clone(),
-                content: Self::to_message_content(
-                    &m.role,
-                    &m.content,
-                    !self.merge_system_into_user,
-                ),
+                content: Self::to_message_content(&m.role, &m.content, !merge),
             })
             .collect();
 
@@ -1840,25 +2011,18 @@ impl Provider for OpenAiCompatibleProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<ProviderChatResponse> {
-        let credential = self.credential.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "{} API key not set. Run `zeroclaw onboard` or set the appropriate env var.",
-                self.name
-            )
-        })?;
+        let credential = self.credential.as_deref();
 
+        let merge = self.effective_merge_system(model);
         let tools = Self::convert_tool_specs(request.tools);
-        let effective_messages = if self.merge_system_into_user {
+        let effective_messages = if merge {
             Self::flatten_system_messages(request.messages)
         } else {
             request.messages.to_vec()
         };
         let native_request = NativeChatRequest {
             model: model.to_string(),
-            messages: Self::convert_messages_for_native(
-                &effective_messages,
-                !self.merge_system_into_user,
-            ),
+            messages: Self::convert_messages_for_native(&effective_messages, !merge),
             temperature,
             stream: Some(false),
             reasoning_effort: self.reasoning_effort_for_model(model),
@@ -1984,22 +2148,11 @@ impl Provider for OpenAiCompatibleProvider {
             return stream::once(async { Ok(StreamEvent::Final) }).boxed();
         }
 
-        let credential = match self.credential.as_ref() {
-            Some(value) => value.clone(),
-            None => {
-                let provider_name = self.name.clone();
-                return stream::once(async move {
-                    Err(StreamError::Provider(format!(
-                        "{} API key not set",
-                        provider_name
-                    )))
-                })
-                .boxed();
-            }
-        };
+        let credential = self.credential.clone();
 
+        let merge = self.effective_merge_system(model);
         let has_tools = request.tools.is_some_and(|tools| !tools.is_empty());
-        let effective_messages = if self.merge_system_into_user {
+        let effective_messages = if merge {
             Self::flatten_system_messages(request.messages)
         } else {
             request.messages.to_vec()
@@ -2009,10 +2162,7 @@ impl Provider for OpenAiCompatibleProvider {
         let payload = if has_tools {
             serde_json::to_value(NativeChatRequest {
                 model: model.to_string(),
-                messages: Self::convert_messages_for_native(
-                    &effective_messages,
-                    !self.merge_system_into_user,
-                ),
+                messages: Self::convert_messages_for_native(&effective_messages, !merge),
                 temperature,
                 reasoning_effort: self.reasoning_effort.clone(),
                 tool_stream: if options.enabled { Some(true) } else { None },
@@ -2026,11 +2176,7 @@ impl Provider for OpenAiCompatibleProvider {
                 .iter()
                 .map(|message| Message {
                     role: message.role.clone(),
-                    content: Self::to_message_content(
-                        &message.role,
-                        &message.content,
-                        !self.merge_system_into_user,
-                    ),
+                    content: Self::to_message_content(&message.role, &message.content, !merge),
                 })
                 .collect();
 
@@ -2064,13 +2210,7 @@ impl Provider for OpenAiCompatibleProvider {
         tokio::spawn(async move {
             let mut req_builder = client.post(&url).json(&payload);
 
-            req_builder = match &auth_header {
-                AuthStyle::Bearer => {
-                    req_builder.header("Authorization", format!("Bearer {}", credential))
-                }
-                AuthStyle::XApiKey => req_builder.header("x-api-key", &credential),
-                AuthStyle::Custom(header) => req_builder.header(header, &credential),
-            };
+            req_builder = apply_auth_to_request(req_builder, &auth_header, credential.as_deref());
             req_builder = req_builder.header("Accept", "text/event-stream");
 
             let response = match req_builder.send().await {
@@ -2115,31 +2255,31 @@ impl Provider for OpenAiCompatibleProvider {
         temperature: f64,
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
-        let credential = match self.credential.as_ref() {
-            Some(value) => value.clone(),
-            None => {
-                let provider_name = self.name.clone();
-                return stream::once(async move {
-                    Err(StreamError::Provider(format!(
-                        "{} API key not set",
-                        provider_name
-                    )))
-                })
-                .boxed();
-            }
-        };
+        let credential = self.credential.clone();
 
+        let merge = self.effective_merge_system(model);
         let mut messages = Vec::new();
-        if let Some(sys) = system_prompt {
+        if merge {
+            let content = match system_prompt {
+                Some(sys) => format!("{sys}\n\n{message}"),
+                None => message.to_string(),
+            };
             messages.push(Message {
-                role: "system".to_string(),
-                content: MessageContent::Text(sys.to_string()),
+                role: "user".to_string(),
+                content: Self::to_message_content("user", &content, !merge),
+            });
+        } else {
+            if let Some(sys) = system_prompt {
+                messages.push(Message {
+                    role: "system".to_string(),
+                    content: MessageContent::Text(sys.to_string()),
+                });
+            }
+            messages.push(Message {
+                role: "user".to_string(),
+                content: Self::to_message_content("user", message, !merge),
             });
         }
-        messages.push(Message {
-            role: "user".to_string(),
-            content: Self::to_message_content("user", message, !self.merge_system_into_user),
-        });
 
         let request = ApiChatRequest {
             model: model.to_string(),
@@ -2165,13 +2305,7 @@ impl Provider for OpenAiCompatibleProvider {
             let mut req_builder = client.post(&url).json(&request);
 
             // Apply auth header
-            req_builder = match &auth_header {
-                AuthStyle::Bearer => {
-                    req_builder.header("Authorization", format!("Bearer {}", credential))
-                }
-                AuthStyle::XApiKey => req_builder.header("x-api-key", &credential),
-                AuthStyle::Custom(header) => req_builder.header(header, &credential),
-            };
+            req_builder = apply_auth_to_request(req_builder, &auth_header, credential.as_deref());
 
             // Set accept header for streaming
             req_builder = req_builder.header("Accept", "text/event-stream");
@@ -2214,17 +2348,95 @@ impl Provider for OpenAiCompatibleProvider {
         .boxed()
     }
 
+    fn stream_chat_with_history(
+        &self,
+        messages: &[ChatMessage],
+        model: &str,
+        temperature: f64,
+        options: StreamOptions,
+    ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+        let credential = self.credential.clone();
+
+        let merge = self.effective_merge_system(model);
+        let effective_messages = if merge {
+            Self::flatten_system_messages(messages)
+        } else {
+            messages.to_vec()
+        };
+        let api_messages: Vec<Message> = effective_messages
+            .iter()
+            .map(|m| Message {
+                role: m.role.clone(),
+                content: Self::to_message_content(&m.role, &m.content, !merge),
+            })
+            .collect();
+
+        let request = ApiChatRequest {
+            model: model.to_string(),
+            messages: api_messages,
+            temperature,
+            stream: Some(options.enabled),
+            reasoning_effort: self.reasoning_effort_for_model(model),
+            tool_stream: None,
+            tools: None,
+            tool_choice: None,
+            max_tokens: self.max_tokens,
+        };
+
+        let url = self.chat_completions_url();
+        let client = self.http_client();
+        let auth_header = self.auth_header.clone();
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(100);
+
+        tokio::spawn(async move {
+            let mut req_builder = client.post(&url).json(&request);
+            req_builder = apply_auth_to_request(req_builder, &auth_header, credential.as_deref());
+            req_builder = req_builder.header("Accept", "text/event-stream");
+
+            let response = match req_builder.send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = tx.send(Err(StreamError::Http(e))).await;
+                    return;
+                }
+            };
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let error = match response.text().await {
+                    Ok(e) => e,
+                    Err(_) => format!("HTTP error: {}", status),
+                };
+                let _ = tx
+                    .send(Err(StreamError::Provider(format!("{}: {}", status, error))))
+                    .await;
+                return;
+            }
+
+            let mut chunk_stream = sse_bytes_to_chunks(response, options.count_tokens);
+            while let Some(chunk) = chunk_stream.next().await {
+                if tx.send(chunk).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|chunk| (chunk, rx))
+        })
+        .boxed()
+    }
+
     async fn warmup(&self) -> anyhow::Result<()> {
-        if let Some(credential) = self.credential.as_ref() {
-            // Hit the chat completions URL with a GET to establish the connection pool.
-            // The server will likely return 405 Method Not Allowed, which is fine -
-            // the goal is TLS handshake and HTTP/2 negotiation.
-            let url = self.chat_completions_url();
-            let _ = self
-                .apply_auth_header(self.http_client().get(&url), credential)
-                .send()
-                .await?;
-        }
+        // Hit the chat completions URL with a GET to establish the connection pool.
+        // The server will likely return 405 Method Not Allowed, which is fine -
+        // the goal is TLS handshake and HTTP/2 negotiation.
+        let url = self.chat_completions_url();
+        let _ = self
+            .apply_auth_header(self.http_client().get(&url), self.credential.as_deref())
+            .send()
+            .await?;
         Ok(())
     }
 }
@@ -2262,16 +2474,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_fails_without_key() {
-        let p = make_provider("Venice", "https://api.venice.ai", None);
-        let result = p
-            .chat_with_system(None, "hello", "llama-3.3-70b", 0.7)
-            .await;
+    async fn chat_without_key_attempts_request() {
+        let p = make_provider("Local", "http://127.0.0.1:1", None);
+        let result = p.chat_with_system(None, "hello", "default", 0.7).await;
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Venice API key not set"));
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            !err_msg.contains("API key not set"),
+            "should not get credential error, got: {err_msg}"
+        );
     }
 
     #[test]
@@ -2368,25 +2579,99 @@ mod tests {
         assert!(matches!(p.auth_header, AuthStyle::Custom(_)));
     }
 
+    #[test]
+    fn zhipu_jwt_produces_valid_three_part_token() {
+        let result = zhipu_jwt_bearer("testid.testsecret").unwrap();
+        assert!(result.starts_with("Bearer "));
+        let jwt = result.strip_prefix("Bearer ").unwrap();
+        let parts: Vec<&str> = jwt.split('.').collect();
+        assert_eq!(parts.len(), 3, "JWT must have 3 dot-separated parts: {jwt}");
+    }
+
+    #[test]
+    fn zhipu_jwt_header_is_correct() {
+        use base64::engine::{Engine, general_purpose::URL_SAFE_NO_PAD};
+        let result = zhipu_jwt_bearer("myid.mysecret").unwrap();
+        let jwt = result.strip_prefix("Bearer ").unwrap();
+        let header_b64 = jwt.split('.').next().unwrap();
+        let header_bytes = URL_SAFE_NO_PAD.decode(header_b64).unwrap();
+        let header: serde_json::Value = serde_json::from_slice(&header_bytes).unwrap();
+        assert_eq!(header["alg"], "HS256");
+        assert_eq!(header["typ"], "JWT");
+        assert_eq!(header["sign_type"], "SIGN");
+    }
+
+    #[test]
+    fn zhipu_jwt_payload_contains_api_key_and_timestamps() {
+        use base64::engine::{Engine, general_purpose::URL_SAFE_NO_PAD};
+        let result = zhipu_jwt_bearer("myapiid.mysecretkey").unwrap();
+        let jwt = result.strip_prefix("Bearer ").unwrap();
+        let payload_b64 = jwt.split('.').nth(1).unwrap();
+        let payload_bytes = URL_SAFE_NO_PAD.decode(payload_b64).unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&payload_bytes).unwrap();
+        assert_eq!(payload["api_key"], "myapiid");
+        assert!(payload["exp"].is_number());
+        assert!(payload["timestamp"].is_number());
+        // exp should be ~210s after timestamp
+        let ts = payload["timestamp"].as_u64().unwrap();
+        let exp = payload["exp"].as_u64().unwrap();
+        assert_eq!(exp - ts, 210_000);
+    }
+
+    #[test]
+    fn zhipu_jwt_signature_is_verifiable() {
+        let secret = "testsecret123";
+        let credential = format!("testid.{secret}");
+        let result = zhipu_jwt_bearer(&credential).unwrap();
+        let jwt = result.strip_prefix("Bearer ").unwrap();
+        let parts: Vec<&str> = jwt.split('.').collect();
+        let signing_input = format!("{}.{}", parts[0], parts[1]);
+
+        // Verify HMAC-SHA256 signature
+        let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, secret.as_bytes());
+        use base64::engine::{Engine, general_purpose::URL_SAFE_NO_PAD};
+        let sig_bytes = URL_SAFE_NO_PAD.decode(parts[2]).unwrap();
+        ring::hmac::verify(&key, signing_input.as_bytes(), &sig_bytes)
+            .expect("signature must verify");
+    }
+
+    #[test]
+    fn zhipu_jwt_rejects_invalid_key_format() {
+        assert!(zhipu_jwt_bearer("no-dot-here").is_err());
+        assert!(zhipu_jwt_bearer("").is_err());
+    }
+
+    #[test]
+    fn zhipu_jwt_auth_style_applies_correctly() {
+        let p = OpenAiCompatibleProvider::new(
+            "Z.AI",
+            "https://api.z.ai/api/coding/paas/v4",
+            Some("testid.testsecret"),
+            AuthStyle::ZhipuJwt,
+        );
+        assert!(matches!(p.auth_header, AuthStyle::ZhipuJwt));
+    }
+
     #[tokio::test]
-    async fn all_compatible_providers_fail_without_key() {
+    async fn all_compatible_providers_attempt_request_without_key() {
         let providers = vec![
-            make_provider("Venice", "https://api.venice.ai", None),
-            make_provider("Moonshot", "https://api.moonshot.cn", None),
-            make_provider("GLM", "https://open.bigmodel.cn", None),
-            make_provider("MiniMax", "https://api.minimaxi.com/v1", None),
-            make_provider("Groq", "https://api.groq.com/openai", None),
-            make_provider("Mistral", "https://api.mistral.ai", None),
-            make_provider("xAI", "https://api.x.ai", None),
-            make_provider("Astrai", "https://as-trai.com/v1", None),
+            make_provider("Venice", "http://127.0.0.1:1", None),
+            make_provider("Moonshot", "http://127.0.0.1:1", None),
+            make_provider("GLM", "http://127.0.0.1:1", None),
+            make_provider("MiniMax", "http://127.0.0.1:1", None),
+            make_provider("Groq", "http://127.0.0.1:1", None),
+            make_provider("Mistral", "http://127.0.0.1:1", None),
+            make_provider("xAI", "http://127.0.0.1:1", None),
+            make_provider("Astrai", "http://127.0.0.1:1", None),
         ];
 
         for p in providers {
             let result = p.chat_with_system(None, "test", "model", 0.7).await;
-            assert!(result.is_err(), "{} should fail without key", p.name);
+            assert!(result.is_err(), "{} should fail (unreachable host)", p.name);
+            let err_msg = result.unwrap_err().to_string();
             assert!(
-                result.unwrap_err().to_string().contains("API key not set"),
-                "{} error should mention key",
+                !err_msg.contains("API key not set"),
+                "{} should get transport error, not credential error, got: {err_msg}",
                 p.name
             );
         }
@@ -2484,13 +2769,18 @@ mod tests {
     async fn chat_via_responses_requires_non_system_message() {
         let provider = make_provider("custom", "https://api.example.com", Some("test-key"));
         let err = provider
-            .chat_via_responses("test-key", &[ChatMessage::system("policy")], "gpt-test")
+            .chat_via_responses(
+                Some("test-key"),
+                &[ChatMessage::system("policy")],
+                "gpt-test",
+            )
             .await
             .expect_err("system-only fallback payload should fail");
 
-        assert!(err
-            .to_string()
-            .contains("requires at least one non-system message"));
+        assert!(
+            err.to_string()
+                .contains("requires at least one non-system message")
+        );
     }
 
     #[test]
@@ -2898,10 +3188,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn warmup_without_key_is_noop() {
-        let provider = make_provider("test", "https://example.com", None);
+    async fn warmup_without_key_attempts_connection() {
+        let provider = make_provider("test", "http://127.0.0.1:1", None);
         let result = provider.warmup().await;
-        assert!(result.is_ok());
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            !err_msg.contains("API key not set"),
+            "should not get credential error, got: {err_msg}"
+        );
     }
 
     // ══════════════════════════════════════════════════════════
@@ -3238,8 +3533,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_with_tools_fails_without_key() {
-        let p = make_provider("TestProvider", "https://example.com", None);
+    async fn chat_with_tools_without_key_attempts_request() {
+        let p = make_provider("TestProvider", "http://127.0.0.1:1", None);
         let messages = vec![ChatMessage {
             role: "user".to_string(),
             content: "hello".to_string(),
@@ -3255,10 +3550,11 @@ mod tests {
 
         let result = p.chat_with_tools(&messages, &tools, "model", 0.7).await;
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("TestProvider API key not set"));
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            !err_msg.contains("API key not set"),
+            "should not get credential error, got: {err_msg}"
+        );
     }
 
     #[test]
@@ -3399,37 +3695,41 @@ mod tests {
     #[test]
     fn parse_sse_line_with_content() {
         let line = r#"data: {"choices":[{"delta":{"content":"hello"}}]}"#;
-        let result = parse_sse_line(line).unwrap();
-        assert_eq!(result, Some("hello".to_string()));
+        let result = parse_sse_line(line).unwrap().unwrap();
+        assert_eq!(result.delta, "hello");
+        assert!(result.reasoning.is_none());
     }
 
     #[test]
     fn parse_sse_line_with_reasoning_content() {
         let line = r#"data: {"choices":[{"delta":{"reasoning_content":"thinking..."}}]}"#;
-        let result = parse_sse_line(line).unwrap();
-        assert_eq!(result, Some("thinking...".to_string()));
+        let result = parse_sse_line(line).unwrap().unwrap();
+        assert!(result.delta.is_empty());
+        assert_eq!(result.reasoning.as_deref(), Some("thinking..."));
     }
 
     #[test]
     fn parse_sse_line_with_both_prefers_content() {
         let line = r#"data: {"choices":[{"delta":{"content":"real answer","reasoning_content":"thinking..."}}]}"#;
-        let result = parse_sse_line(line).unwrap();
-        assert_eq!(result, Some("real answer".to_string()));
+        let result = parse_sse_line(line).unwrap().unwrap();
+        assert_eq!(result.delta, "real answer");
+        assert!(result.reasoning.is_none());
     }
 
     #[test]
-    fn parse_sse_line_with_empty_content_falls_back_to_reasoning_content() {
+    fn parse_sse_line_with_empty_content_falls_back_to_reasoning() {
         let line =
             r#"data: {"choices":[{"delta":{"content":"","reasoning_content":"thinking..."}}]}"#;
-        let result = parse_sse_line(line).unwrap();
-        assert_eq!(result, Some("thinking...".to_string()));
+        let result = parse_sse_line(line).unwrap().unwrap();
+        assert!(result.delta.is_empty());
+        assert_eq!(result.reasoning.as_deref(), Some("thinking..."));
     }
 
     #[test]
     fn parse_sse_line_done_sentinel() {
         let line = "data: [DONE]";
         let result = parse_sse_line(line).unwrap();
-        assert_eq!(result, None);
+        assert!(result.is_none());
     }
 
     #[test]
@@ -3735,5 +4035,79 @@ mod tests {
         assert!(!json.as_object().unwrap().contains_key("type"));
         assert!(!json.as_object().unwrap().contains_key("function"));
         assert!(!json.as_object().unwrap().contains_key("parameters"));
+    }
+
+    // ── parse_proxy_tool_event tests ──
+
+    #[test]
+    fn proxy_tool_start_valid() {
+        let line = r#"data: {"x_tool_start":{"name":"bash","arguments":"{\"cmd\":\"ls\"}"}}"#;
+        let event = parse_proxy_tool_event(line);
+        assert!(matches!(
+            event,
+            Some(StreamEvent::PreExecutedToolCall { ref name, ref args })
+            if name == "bash" && args == r#"{"cmd":"ls"}"#
+        ));
+    }
+
+    #[test]
+    fn proxy_tool_start_missing_name_returns_none() {
+        let line = r#"data: {"x_tool_start":{"arguments":"{}"}}"#;
+        assert!(parse_proxy_tool_event(line).is_none());
+    }
+
+    #[test]
+    fn proxy_tool_start_missing_arguments_defaults() {
+        let line = r#"data: {"x_tool_start":{"name":"read"}}"#;
+        let event = parse_proxy_tool_event(line);
+        assert!(matches!(
+            event,
+            Some(StreamEvent::PreExecutedToolCall { ref name, ref args })
+            if name == "read" && args == "{}"
+        ));
+    }
+
+    #[test]
+    fn proxy_tool_result_valid() {
+        let line = r#"data: {"x_tool_result":{"name":"bash","output":"hello world"}}"#;
+        let event = parse_proxy_tool_event(line);
+        assert!(matches!(
+            event,
+            Some(StreamEvent::PreExecutedToolResult { ref name, ref output })
+            if name == "bash" && output == "hello world"
+        ));
+    }
+
+    #[test]
+    fn proxy_tool_result_missing_fields_uses_defaults() {
+        let line = r#"data: {"x_tool_result":{}}"#;
+        let event = parse_proxy_tool_event(line);
+        assert!(matches!(
+            event,
+            Some(StreamEvent::PreExecutedToolResult { ref name, ref output })
+            if name == "unknown" && output.is_empty()
+        ));
+    }
+
+    #[test]
+    fn proxy_tool_event_non_json_returns_none() {
+        assert!(parse_proxy_tool_event("data: not json").is_none());
+    }
+
+    #[test]
+    fn proxy_tool_event_no_data_prefix_returns_none() {
+        let line = r#"{"x_tool_start":{"name":"bash"}}"#;
+        assert!(parse_proxy_tool_event(line).is_none());
+    }
+
+    #[test]
+    fn proxy_tool_event_standard_openai_chunk_returns_none() {
+        let line = r#"data: {"id":"chatcmpl-1","choices":[{"delta":{"content":"hi"}}]}"#;
+        assert!(parse_proxy_tool_event(line).is_none());
+    }
+
+    #[test]
+    fn proxy_tool_event_done_sentinel_returns_none() {
+        assert!(parse_proxy_tool_event("data: [DONE]").is_none());
     }
 }

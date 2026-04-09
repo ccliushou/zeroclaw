@@ -1,12 +1,70 @@
+use super::Provider;
 use super::traits::{
     ChatMessage, ChatRequest, ChatResponse, StreamChunk, StreamEvent, StreamOptions, StreamResult,
 };
-use super::Provider;
 use async_trait::async_trait;
-use futures_util::{stream, StreamExt};
+use futures_util::{StreamExt, stream};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
+
+// ── Provider Fallback Notification ──────────────────────────────────────
+// When ReliableProvider uses a fallback (different provider or model than
+// requested), it records the details here so channel code can notify the user.
+// Uses tokio::task_local to avoid cross-request leakage between concurrent
+// users (the old global static had a race window).
+
+/// Info about a provider fallback that occurred during a request.
+#[derive(Debug, Clone)]
+pub struct ProviderFallbackInfo {
+    /// Provider that was originally requested.
+    pub requested_provider: String,
+    /// Model that was originally requested.
+    pub requested_model: String,
+    /// Provider that actually served the request.
+    pub actual_provider: String,
+    /// Model that actually served the request.
+    pub actual_model: String,
+}
+
+tokio::task_local! {
+    static PROVIDER_FALLBACK: RefCell<Option<ProviderFallbackInfo>>;
+}
+
+/// Take (consume) the last provider fallback info, if any.
+/// Must be called within a `scope_provider_fallback` scope.
+pub fn take_last_provider_fallback() -> Option<ProviderFallbackInfo> {
+    PROVIDER_FALLBACK
+        .try_with(|cell| cell.borrow_mut().take())
+        .ok()
+        .flatten()
+}
+
+/// Run the given future within a provider-fallback scope.
+/// Both `record_provider_fallback` (inside ReliableProvider) and
+/// `take_last_provider_fallback` (post-loop channel code) must execute
+/// within this scope for the data to be visible.
+pub async fn scope_provider_fallback<F: std::future::Future>(future: F) -> F::Output {
+    PROVIDER_FALLBACK.scope(RefCell::new(None), future).await
+}
+
+/// Record a provider fallback event.
+fn record_provider_fallback(
+    requested_provider: &str,
+    requested_model: &str,
+    actual_provider: &str,
+    actual_model: &str,
+) {
+    let _ = PROVIDER_FALLBACK.try_with(|cell| {
+        *cell.borrow_mut() = Some(ProviderFallbackInfo {
+            requested_provider: requested_provider.to_string(),
+            requested_model: requested_model.to_string(),
+            actual_provider: actual_provider.to_string(),
+            actual_model: actual_model.to_string(),
+        });
+    });
+}
 
 // ── Error Classification ─────────────────────────────────────────────────
 // Errors are split into retryable (transient server/network failures) and
@@ -78,6 +136,34 @@ pub fn is_non_retryable(err: &anyhow::Error) -> bool {
             || msg_lower.contains("unsupported")
             || msg_lower.contains("does not exist")
             || msg_lower.contains("invalid"))
+}
+
+/// Check if an error indicates an authentication/authorization failure.
+/// Used by channels to evict cached providers whose OAuth tokens may have
+/// expired so the next request triggers a fresh credential resolution (#5219).
+pub fn is_auth_error(err: &anyhow::Error) -> bool {
+    if let Some(reqwest_err) = err.downcast_ref::<reqwest::Error>() {
+        if let Some(status) = reqwest_err.status() {
+            let code = status.as_u16();
+            return code == 401 || code == 403;
+        }
+    }
+
+    let msg_lower = err.to_string().to_lowercase();
+    let hints = [
+        "401 unauthorized",
+        "403 forbidden",
+        "invalid api key",
+        "incorrect api key",
+        "authentication failed",
+        "auth failed",
+        "unauthorized",
+        "invalid token",
+        "token expired",
+        "access_token",
+    ];
+
+    hints.iter().any(|hint| msg_lower.contains(hint))
 }
 
 /// Check if an error is a tool schema validation failure (e.g. Groq returning
@@ -382,13 +468,28 @@ impl Provider for ReliableProvider {
                         .await
                     {
                         Ok(resp) => {
-                            if attempt > 0 || *current_model != model {
+                            if attempt > 0
+                                || *current_model != model
+                                || self.providers.first().map(|(n, _)| n.as_str())
+                                    != Some(provider_name)
+                            {
                                 tracing::info!(
                                     provider = provider_name,
                                     model = *current_model,
                                     attempt,
                                     original_model = model,
                                     "Provider recovered (failover/retry)"
+                                );
+                                let primary = self
+                                    .providers
+                                    .first()
+                                    .map(|(n, _)| n.as_str())
+                                    .unwrap_or("");
+                                record_provider_fallback(
+                                    primary,
+                                    model,
+                                    provider_name,
+                                    current_model,
                                 );
                             }
                             return Ok(resp);
@@ -515,7 +616,12 @@ impl Provider for ReliableProvider {
                         .await
                     {
                         Ok(resp) => {
-                            if attempt > 0 || *current_model != model || context_truncated {
+                            if attempt > 0
+                                || *current_model != model
+                                || context_truncated
+                                || self.providers.first().map(|(n, _)| n.as_str())
+                                    != Some(provider_name)
+                            {
                                 tracing::info!(
                                     provider = provider_name,
                                     model = *current_model,
@@ -523,6 +629,17 @@ impl Provider for ReliableProvider {
                                     original_model = model,
                                     context_truncated,
                                     "Provider recovered (failover/retry)"
+                                );
+                                let primary = self
+                                    .providers
+                                    .first()
+                                    .map(|(n, _)| n.as_str())
+                                    .unwrap_or("");
+                                record_provider_fallback(
+                                    primary,
+                                    model,
+                                    provider_name,
+                                    current_model,
                                 );
                             }
                             return Ok(resp);
@@ -669,7 +786,12 @@ impl Provider for ReliableProvider {
                         .await
                     {
                         Ok(resp) => {
-                            if attempt > 0 || *current_model != model || context_truncated {
+                            if attempt > 0
+                                || *current_model != model
+                                || context_truncated
+                                || self.providers.first().map(|(n, _)| n.as_str())
+                                    != Some(provider_name)
+                            {
                                 tracing::info!(
                                     provider = provider_name,
                                     model = *current_model,
@@ -677,6 +799,17 @@ impl Provider for ReliableProvider {
                                     original_model = model,
                                     context_truncated,
                                     "Provider recovered (failover/retry)"
+                                );
+                                let primary = self
+                                    .providers
+                                    .first()
+                                    .map(|(n, _)| n.as_str())
+                                    .unwrap_or("");
+                                record_provider_fallback(
+                                    primary,
+                                    model,
+                                    provider_name,
+                                    current_model,
                                 );
                             }
                             return Ok(resp);
@@ -810,7 +943,12 @@ impl Provider for ReliableProvider {
                     };
                     match provider.chat(req, current_model, temperature).await {
                         Ok(resp) => {
-                            if attempt > 0 || *current_model != model || context_truncated {
+                            if attempt > 0
+                                || *current_model != model
+                                || context_truncated
+                                || self.providers.first().map(|(n, _)| n.as_str())
+                                    != Some(provider_name)
+                            {
                                 tracing::info!(
                                     provider = provider_name,
                                     model = *current_model,
@@ -818,6 +956,17 @@ impl Provider for ReliableProvider {
                                     original_model = model,
                                     context_truncated,
                                     "Provider recovered (failover/retry)"
+                                );
+                                let primary = self
+                                    .providers
+                                    .first()
+                                    .map(|(n, _)| n.as_str())
+                                    .unwrap_or("");
+                                record_provider_fallback(
+                                    primary,
+                                    model,
+                                    provider_name,
+                                    current_model,
                                 );
                             }
                             return Ok(resp);
@@ -1031,7 +1180,7 @@ impl Provider for ReliableProvider {
 
             // Try the first model in the chain for streaming
             let current_model = match self.model_chain(model).first() {
-                Some(m) => m.to_string(),
+                Some(m) => (*m).to_string(),
                 None => model.to_string(),
             };
 
@@ -1098,7 +1247,7 @@ impl Provider for ReliableProvider {
             let provider_clone = provider_name.clone();
 
             let current_model = match self.model_chain(model).first() {
-                Some(m) => m.to_string(),
+                Some(m) => (*m).to_string(),
                 None => model.to_string(),
             };
 
@@ -1362,6 +1511,19 @@ mod tests {
         assert!(!is_non_retryable(&anyhow::anyhow!(
             "OpenAI Codex stream error: Your input exceeds the context window of this model."
         )));
+    }
+
+    #[test]
+    fn auth_error_detects_common_patterns() {
+        assert!(is_auth_error(&anyhow::anyhow!("401 Unauthorized")));
+        assert!(is_auth_error(&anyhow::anyhow!("403 Forbidden")));
+        assert!(is_auth_error(&anyhow::anyhow!("invalid api key")));
+        assert!(is_auth_error(&anyhow::anyhow!("authentication failed")));
+        assert!(is_auth_error(&anyhow::anyhow!("token expired")));
+        assert!(!is_auth_error(&anyhow::anyhow!("400 Bad Request")));
+        assert!(!is_auth_error(&anyhow::anyhow!("429 Too Many Requests")));
+        assert!(!is_auth_error(&anyhow::anyhow!("timeout")));
+        assert!(!is_auth_error(&anyhow::anyhow!("connection reset")));
     }
 
     #[tokio::test]
@@ -2312,7 +2474,7 @@ mod tests {
         assert_eq!(messages[0].role, "system");
         // Remaining messages should be the newer ones
         assert_eq!(messages.len(), 4); // system + 3 remaining non-system
-                                       // The last message should still be the most recent user message
+        // The last message should still be the most recent user message
         assert_eq!(messages.last().unwrap().content, "msg3");
     }
 
@@ -2813,5 +2975,49 @@ mod tests {
             "unexpected error: {err}"
         );
         assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn fallback_records_provider_fallback_info() {
+        scope_provider_fallback(async {
+            let provider = ReliableProvider::new(
+                vec![
+                    (
+                        "broken".into(),
+                        Box::new(MockProvider {
+                            calls: Arc::new(AtomicUsize::new(0)),
+                            fail_until_attempt: 99, // always fail
+                            response: "unused",
+                            error: "401 Unauthorized",
+                        }),
+                    ),
+                    (
+                        "working".into(),
+                        Box::new(MockProvider {
+                            calls: Arc::new(AtomicUsize::new(0)),
+                            fail_until_attempt: 0,
+                            response: "hello from working",
+                            error: "unused",
+                        }),
+                    ),
+                ],
+                2,
+                1,
+            );
+
+            let resp = provider.simple_chat("hi", "test-model", 0.0).await.unwrap();
+            assert_eq!(resp, "hello from working");
+
+            let fb = take_last_provider_fallback();
+            assert!(fb.is_some(), "fallback info should be recorded");
+            let fb = fb.unwrap();
+            assert_eq!(fb.requested_provider, "broken");
+            assert_eq!(fb.actual_provider, "working");
+            assert_eq!(fb.actual_model, "test-model");
+
+            // Second take should be None.
+            assert!(take_last_provider_fallback().is_none());
+        })
+        .await;
     }
 }

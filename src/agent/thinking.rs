@@ -16,6 +16,7 @@
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use zeroclaw_macros::Configurable;
 
 /// How deeply the model should reason for a given message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, JsonSchema)]
@@ -36,6 +37,10 @@ pub enum ThinkingLevel {
     Max,
 }
 
+impl crate::config::HasPropKind for ThinkingLevel {
+    const PROP_KIND: crate::config::PropKind = crate::config::PropKind::Enum;
+}
+
 impl ThinkingLevel {
     /// Parse a thinking level from a string (case-insensitive).
     pub fn from_str_insensitive(s: &str) -> Option<Self> {
@@ -52,7 +57,8 @@ impl ThinkingLevel {
 }
 
 /// Configuration for thinking/reasoning level control.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[prefix = "agent.thinking"]
 pub struct ThinkingConfig {
     /// Default thinking level when no directive is present.
     #[serde(default)]
@@ -310,11 +316,13 @@ mod tests {
         assert!(params.temperature_adjustment < 0.0);
         assert!(params.max_tokens_adjustment < 0);
         assert!(params.system_prompt_prefix.is_some());
-        assert!(params
-            .system_prompt_prefix
-            .unwrap()
-            .to_lowercase()
-            .contains("concise"));
+        assert!(
+            params
+                .system_prompt_prefix
+                .unwrap()
+                .to_lowercase()
+                .contains("concise")
+        );
     }
 
     #[test]
